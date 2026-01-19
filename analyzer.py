@@ -31,21 +31,7 @@ logger = logging.getLogger(__name__)
 
 # 股票名称映射（常见股票）
 STOCK_NAME_MAP = {
-    '600519': '贵州茅台',
-    '000001': '平安银行',
-    '300750': '宁德时代',
-    '002594': '比亚迪',
-    '600036': '招商银行',
-    '601318': '中国平安',
-    '000858': '五粮液',
-    '600276': '恒瑞医药',
-    '601012': '隆基绿能',
-    '002475': '立讯精密',
-    '300059': '东方财富',
-    '002415': '海康威视',
-    '600900': '长江电力',
-    '601166': '兴业银行',
-    '600028': '中国石化',
+
 }
 
 
@@ -386,309 +372,88 @@ class GeminiAnalyzer:
         """
         初始化 AI 分析器
         
-        优先级：Gemini > OpenAI 兼容 API
-        
-        Args:
-            api_key: Gemini API Key（可选，默认从配置读取）
+        使用 OpenAI 兼容 API（优先匹配 src_data/llm_example.py 配置）
         """
         config = get_config()
-        self._api_key = api_key or config.gemini_api_key
-        self._model = None
-        self._current_model_name = None  # 当前使用的模型名称
-        self._using_fallback = False  # 是否正在使用备选模型
-        self._use_openai = False  # 是否使用 OpenAI 兼容 API
-        self._openai_client = None  # OpenAI 客户端
+        self._api_key = api_key or config.openai_api_key  # 优先使用 OpenAI Key
+        self._base_url = config.openai_base_url
+        self._model_name = config.openai_model
         
-        # 检查 Gemini API Key 是否有效（过滤占位符）
-        gemini_key_valid = self._api_key and not self._api_key.startswith('your_') and len(self._api_key) > 10
+        self._client = None
+        self._is_available = False
         
-        # 优先尝试初始化 Gemini
-        if gemini_key_valid:
-            try:
-                self._init_model()
-            except Exception as e:
-                logger.warning(f"Gemini 初始化失败: {e}，尝试 OpenAI 兼容 API")
-                self._init_openai_fallback()
-        else:
-            # Gemini Key 未配置，尝试 OpenAI
-            logger.info("Gemini API Key 未配置，尝试使用 OpenAI 兼容 API")
-            self._init_openai_fallback()
+        self._init_client()
         
-        # 两者都未配置
-        if not self._model and not self._openai_client:
-            logger.warning("未配置任何 AI API Key，AI 分析功能将不可用")
-    
-    def _init_openai_fallback(self) -> None:
-        """
-        初始化 OpenAI 兼容 API 作为备选
-        
-        支持所有 OpenAI 格式的 API，包括：
-        - OpenAI 官方
-        - DeepSeek
-        - 通义千问
-        - Moonshot 等
-        """
-        config = get_config()
-        
-        # 检查 OpenAI API Key 是否有效（过滤占位符）
-        openai_key_valid = (
-            config.openai_api_key and 
-            not config.openai_api_key.startswith('your_') and 
-            len(config.openai_api_key) > 10
-        )
-        
-        if not openai_key_valid:
-            logger.debug("OpenAI 兼容 API 未配置或配置无效")
-            return
-        
-        # 分离 import 和客户端创建，以便提供更准确的错误信息
+    def _init_client(self) -> None:
+        """初始化 OpenAI 客户端"""
         try:
             from openai import OpenAI
-        except ImportError:
-            logger.error("未安装 openai 库，请运行: pip install openai")
-            return
-        
-        try:
-            # base_url 可选，不填则使用 OpenAI 官方默认地址
-            client_kwargs = {"api_key": config.openai_api_key}
-            if config.openai_base_url and config.openai_base_url.startswith('http'):
-                client_kwargs["base_url"] = config.openai_base_url
+            import httpx
             
-            self._openai_client = OpenAI(**client_kwargs)
-            self._current_model_name = config.openai_model
-            self._use_openai = True
-            logger.info(f"OpenAI 兼容 API 初始化成功 (base_url: {config.openai_base_url}, model: {config.openai_model})")
-        except ImportError as e:
-            # 依赖缺失（如 socksio）
-            if 'socksio' in str(e).lower() or 'socks' in str(e).lower():
-                logger.error(f"OpenAI 客户端需要 SOCKS 代理支持，请运行: pip install httpx[socks] 或 pip install socksio")
-            else:
-                logger.error(f"OpenAI 依赖缺失: {e}")
-        except Exception as e:
-            error_msg = str(e).lower()
-            if 'socks' in error_msg or 'socksio' in error_msg or 'proxy' in error_msg:
-                logger.error(f"OpenAI 代理配置错误: {e}，如使用 SOCKS 代理请运行: pip install httpx[socks]")
-            else:
-                logger.error(f"OpenAI 兼容 API 初始化失败: {e}")
-    
-    def _init_model(self) -> None:
-        """
-        初始化 Gemini 模型
-        
-        配置：
-        - 使用 gemini-3-flash-preview 或 gemini-2.5-flash 模型
-        - 不启用 Google Search（使用外部 Tavily/SerpAPI 搜索）
-        """
-        try:
-            import google.generativeai as genai
+            logger.info(f"正在初始化 OpenAI 客户端 (base_url: {self._base_url}, model: {self._model_name})...")
             
-            # 配置 API Key
-            genai.configure(api_key=self._api_key)
-            
-            # 从配置获取模型名称
-            config = get_config()
-            model_name = config.gemini_model
-            fallback_model = config.gemini_model_fallback
-            
-            # 不再使用 Google Search Grounding（已知有兼容性问题）
-            # 改为使用外部搜索服务（Tavily/SerpAPI）预先获取新闻
-            
-            # 尝试初始化主模型
-            try:
-                self._model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=self.SYSTEM_PROMPT,
-                )
-                self._current_model_name = model_name
-                self._using_fallback = False
-                logger.info(f"Gemini 模型初始化成功 (模型: {model_name})")
-            except Exception as model_error:
-                # 尝试备选模型
-                logger.warning(f"主模型 {model_name} 初始化失败: {model_error}，尝试备选模型 {fallback_model}")
-                self._model = genai.GenerativeModel(
-                    model_name=fallback_model,
-                    system_instruction=self.SYSTEM_PROMPT,
-                )
-                self._current_model_name = fallback_model
-                self._using_fallback = True
-                logger.info(f"Gemini 备选模型初始化成功 (模型: {fallback_model})")
-            
-        except Exception as e:
-            logger.error(f"Gemini 模型初始化失败: {e}")
-            self._model = None
-    
-    def _switch_to_fallback_model(self) -> bool:
-        """
-        切换到备选模型
-        
-        Returns:
-            是否成功切换
-        """
-        try:
-            import google.generativeai as genai
-            config = get_config()
-            fallback_model = config.gemini_model_fallback
-            
-            logger.warning(f"[LLM] 切换到备选模型: {fallback_model}")
-            self._model = genai.GenerativeModel(
-                model_name=fallback_model,
-                system_instruction=self.SYSTEM_PROMPT,
+            self._client = OpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                http_client=httpx.Client(timeout=120)  # 增加超时设置
             )
-            self._current_model_name = fallback_model
-            self._using_fallback = True
-            logger.info(f"[LLM] 备选模型 {fallback_model} 初始化成功")
-            return True
+            self._is_available = True
+            logger.info(f"OpenAI 客户端初始化成功")
+            
         except Exception as e:
-            logger.error(f"[LLM] 切换备选模型失败: {e}")
-            return False
+            logger.error(f"OpenAI 客户端初始化失败: {e}")
+            self._client = None
+            self._is_available = False
+    
+
     
     def is_available(self) -> bool:
         """检查分析器是否可用"""
-        return self._model is not None or self._openai_client is not None
+        return self._is_available
     
-    def _call_openai_api(self, prompt: str, generation_config: dict) -> str:
+    def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
         """
-        调用 OpenAI 兼容 API
-        
-        Args:
-            prompt: 提示词
-            generation_config: 生成配置
-            
-        Returns:
-            响应文本
+        调用 AI API (仅支持 OpenAI 兼容接口)
         """
         config = get_config()
         max_retries = config.gemini_max_retries
         base_delay = config.gemini_retry_delay
         
+        if not self._client:
+            raise RuntimeError("OpenAI 客户端未初始化")
+
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
                     delay = base_delay * (2 ** (attempt - 1))
                     delay = min(delay, 60)
-                    logger.info(f"[OpenAI] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    logger.info(f"及第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
-                response = self._openai_client.chat.completions.create(
-                    model=self._current_model_name,
+                response = self._client.chat.completions.create(
+                    model=self._model_name,
                     messages=[
                         {"role": "system", "content": self.SYSTEM_PROMPT},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=generation_config.get('temperature', 0.7),
                     max_tokens=generation_config.get('max_output_tokens', 8192),
+                    stream=False
                 )
                 
                 if response and response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content
                 else:
-                    raise ValueError("OpenAI API 返回空响应")
+                    raise ValueError("API 返回空响应")
                     
             except Exception as e:
                 error_str = str(e)
-                is_rate_limit = '429' in error_str or 'rate' in error_str.lower() or 'quota' in error_str.lower()
-                
-                if is_rate_limit:
-                    logger.warning(f"[OpenAI] API 限流，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
-                else:
-                    logger.warning(f"[OpenAI] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                logger.warning(f"API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
                 
                 if attempt == max_retries - 1:
                     raise
-        
-        raise Exception("OpenAI API 调用失败，已达最大重试次数")
-    
-    def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
-        """
-        调用 AI API，带有重试和模型切换机制
-        
-        优先级：Gemini > Gemini 备选模型 > OpenAI 兼容 API
-        
-        处理 429 限流错误：
-        1. 先指数退避重试
-        2. 多次失败后切换到备选模型
-        3. Gemini 完全失败后尝试 OpenAI
-        
-        Args:
-            prompt: 提示词
-            generation_config: 生成配置
-            
-        Returns:
-            响应文本
-        """
-        # 如果已经在使用 OpenAI 模式，直接调用 OpenAI
-        if self._use_openai:
-            return self._call_openai_api(prompt, generation_config)
-        
-        config = get_config()
-        max_retries = config.gemini_max_retries
-        base_delay = config.gemini_retry_delay
-        
-        last_error = None
-        tried_fallback = getattr(self, '_using_fallback', False)
-        
-        for attempt in range(max_retries):
-            try:
-                # 请求前增加延时（防止请求过快触发限流）
-                if attempt > 0:
-                    delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 5, 10, 20, 40...
-                    delay = min(delay, 60)  # 最大60秒
-                    logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
-                    time.sleep(delay)
-                
-                response = self._model.generate_content(
-                    prompt,
-                    generation_config=generation_config,
-                    request_options={"timeout": 120}
-                )
-                
-                if response and response.text:
-                    return response.text
-                else:
-                    raise ValueError("Gemini 返回空响应")
-                    
-            except Exception as e:
-                last_error = e
-                error_str = str(e)
-                
-                # 检查是否是 429 限流错误
-                is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
-                
-                if is_rate_limit:
-                    logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
-                    
-                    # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
-                    if attempt >= max_retries // 2 and not tried_fallback:
-                        if self._switch_to_fallback_model():
-                            tried_fallback = True
-                            logger.info("[Gemini] 已切换到备选模型，继续重试")
-                        else:
-                            logger.warning("[Gemini] 切换备选模型失败，继续使用当前模型重试")
-                else:
-                    # 非限流错误，记录并继续重试
-                    logger.warning(f"[Gemini] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
-        
-        # Gemini 所有重试都失败，尝试 OpenAI 兼容 API
-        if self._openai_client:
-            logger.warning("[Gemini] 所有重试失败，切换到 OpenAI 兼容 API")
-            try:
-                return self._call_openai_api(prompt, generation_config)
-            except Exception as openai_error:
-                logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
-                raise last_error or openai_error
-        elif config.openai_api_key and config.openai_base_url:
-            # 尝试懒加载初始化 OpenAI
-            logger.warning("[Gemini] 所有重试失败，尝试初始化 OpenAI 兼容 API")
-            self._init_openai_fallback()
-            if self._openai_client:
-                try:
-                    return self._call_openai_api(prompt, generation_config)
-                except Exception as openai_error:
-                    logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
-                    raise last_error or openai_error
-        
-        # 所有方式都失败
-        raise last_error or Exception("所有 AI API 调用失败，已达最大重试次数")
+
+        raise Exception("API 调用失败，已达最大重试次数")
     
     def analyze(
         self, 
@@ -750,11 +515,8 @@ class GeminiAnalyzer:
             prompt = self._format_prompt(context, name, news_context)
             
             # 获取模型名称
-            model_name = getattr(self, '_current_model_name', None)
-            if not model_name:
-                model_name = getattr(self._model, '_model_name', 'unknown')
-                if hasattr(self._model, 'model_name'):
-                    model_name = self._model.model_name
+            model_name = self._model_name
+
             
             logger.info(f"========== AI 分析 {name}({code}) ==========")
             logger.info(f"[LLM配置] 模型: {model_name}")
