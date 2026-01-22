@@ -34,6 +34,12 @@ import argparse
 import logging
 import sys
 import time
+import warnings
+import pandas as pd
+
+# 忽略 pandas 的 SettingWithCopyWarning warnings
+warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone, timedelta
 from logging.handlers import RotatingFileHandler

@@ -10,7 +10,9 @@
 3. 使用大模型生成每日大盘复盘报告
 """
 
+import os
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -22,6 +24,36 @@ from config import get_config
 from search_service import SearchService
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def temporary_no_proxy():
+    """
+    临时禁用系统代理 context manager
+    
+    用于 akshare 等库访问国内数据源时避免走代理导致失败
+    """
+    # 保存原有环境变量
+    proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy']
+    old_env = {k: os.environ.get(k) for k in proxy_vars}
+    
+    # 设置 NO_PROXY 为 * (忽略所有代理)，并清除其他代理设置
+    os.environ['NO_PROXY'] = '*'
+    for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+        if k in os.environ:
+            del os.environ[k]
+            
+    try:
+        yield
+    finally:
+        # 恢复环境变量
+        for k, v in old_env.items():
+            if v is None:
+                if k in os.environ:
+                    del os.environ[k]
+            else:
+                os.environ[k] = v
+
 
 
 @dataclass
@@ -140,7 +172,8 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取主要指数实时行情...")
             
             # 使用 akshare 获取指数行情
-            df = ak.stock_zh_index_spot_em()
+            with temporary_no_proxy():
+                df = ak.stock_zh_index_spot_em()
             
             if df is not None and not df.empty:
                 for code, name in self.MAIN_INDICES.items():
@@ -183,7 +216,8 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取市场涨跌统计...")
             
             # 获取全部A股实时行情
-            df = ak.stock_zh_a_spot_em()
+            with temporary_no_proxy():
+                df = ak.stock_zh_a_spot_em()
             
             if df is not None and not df.empty:
                 # 涨跌统计
@@ -217,7 +251,8 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取板块涨跌榜...")
             
             # 获取行业板块行情
-            df = ak.stock_board_industry_name_em()
+            with temporary_no_proxy():
+                df = ak.stock_board_industry_name_em()
             
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
@@ -251,15 +286,34 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取北向资金...")
             
             # 获取北向资金数据
-            df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+            # 修复: akshare >= 1.18.13 移除了 stock_hsgt_north_net_flow_in_em
+            # 改用 stock_hsgt_fund_flow_summary_em
+            with temporary_no_proxy():
+                try:
+                    df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+                except AttributeError:
+                    logger.warning("[大盘] akshare原接口不可用，尝试使用新接口...")
+                    df = ak.stock_hsgt_fund_flow_summary_em()
             
             if df is not None and not df.empty:
                 # 取最新一条数据
                 latest = df.iloc[-1]
+                # 兼容不同接口的字段名
+                flow_val = 0.0
                 if '当日净流入' in df.columns:
-                    overview.north_flow = float(latest['当日净流入']) / 1e8  # 转为亿元
+                    flow_val = float(latest['当日净流入'])
                 elif '净流入' in df.columns:
-                    overview.north_flow = float(latest['净流入']) / 1e8
+                    flow_val = float(latest['净流入'])
+                elif '北向资金今日净买额' in df.columns: # 可能的新字段
+                     flow_val = float(latest['北向资金今日净买额'])
+                elif '今日净买额' in df.columns: # 可能的新字段
+                     flow_val = float(latest['今日净买额'])
+                
+                # 如果没找到字段但有数据，打印列名以便调试
+                if flow_val == 0.0 and len(df.columns) > 0:
+                     logger.debug(f"[大盘] 北向资金列名: {df.columns.tolist()}")
+
+                overview.north_flow = flow_val / 1e8  # 转为亿元
                     
                 logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
                 
