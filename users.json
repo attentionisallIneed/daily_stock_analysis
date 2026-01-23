@@ -1,0 +1,21 @@
+[
+  {
+    "name": "wogua",
+    "email": "731951383@qq.com",
+    "stocks": []
+  },
+  {
+    "name": "LIU",
+    "email": "539925576@qq.com",
+    "stocks": [
+      "600309"
+    ]
+  },
+  {
+    "name": "WEI",
+    "email": "453457696@qq.com",
+    "stocks": [
+      "688002"
+    ]
+  }
+]

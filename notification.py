@@ -1351,13 +1351,14 @@ class NotificationService:
             logger.error(f"响应内容: {response.text}")
             return False
     
-    def send_to_email(self, content: str, subject: Optional[str] = None) -> bool:
+    def send_to_email(self, content: str, subject: Optional[str] = None, receivers: Optional[List[str]] = None) -> bool:
         """
         通过 SMTP 发送邮件（自动识别 SMTP 服务器）
         
         Args:
             content: 邮件内容（支持 Markdown，会转换为 HTML）
             subject: 邮件主题（可选，默认自动生成）
+            receivers: 收件人列表（可选，如果提供则覆盖配置文件的默认收件人）
             
         Returns:
             是否发送成功
@@ -1368,7 +1369,12 @@ class NotificationService:
         
         sender = self._email_config['sender']
         password = self._email_config['password']
-        receivers = self._email_config['receivers']
+        # 优先使用传入的收件人列表，否则使用配置列表
+        receivers = receivers if receivers else self._email_config['receivers']
+        
+        if not receivers:
+            logger.warning("未指定收件人，跳过邮件发送")
+            return False
         
         try:
             # 生成主题

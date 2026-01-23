@@ -23,19 +23,37 @@ A股自选股智能分析系统 - 主调度程序
 """
 import os
 
-# 代理配置 - 仅在本地环境使用，GitHub Actions 不需要
-if os.getenv("GITHUB_ACTIONS") != "true":
-    # 本地开发环境，如需代理请取消注释或修改端口
-    # os.environ["http_proxy"] = "http://127.0.0.1:10809"
-    # os.environ["https_proxy"] = "http://127.0.0.1:10809"
-    pass
-
 import argparse
 import logging
 import sys
 import time
 import warnings
 import pandas as pd
+
+# 代理配置
+# 策略：不清除全局代理，而是将国内数据源域名加入 no_proxy，强制直连
+# 这样可以同时保证：
+# 1. AkShare/Tushare 直连国内服务器（解决 ProxyError）
+# 2. OpenAI/Telegram 继续走代理（解决无法访问的问题）
+domestic_domains = [
+    "eastmoney.com", "dfcfw.com", "sina.com.cn", "163.com", "baidu.com", 
+    "push2.eastmoney.com", "emob.eastmoney.com", "cninfo.com.cn"
+]
+no_proxy = os.environ.get("no_proxy", "")
+# 确保 no_proxy 包含所有国内域名
+for domain in domestic_domains:
+    if domain not in no_proxy:
+        if no_proxy:
+            no_proxy += ","
+        no_proxy += domain
+os.environ["no_proxy"] = no_proxy
+os.environ["NO_PROXY"] = no_proxy
+# 配置日志基本格式，防止 logging 未初始化前调用 info 报错（虽然这里 logging 已经导入）
+# 但更规范的做法是等待 main 函数内初始化日志，或者直接 print
+# 这里为了调试方便，直接 print
+print(f"代理配置优化: 已设置 no_proxy={no_proxy}")
+pass
+
 
 # 忽略 pandas 的 SettingWithCopyWarning warnings
 warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
@@ -56,6 +74,7 @@ from notification import NotificationService, NotificationChannel, send_daily_re
 from search_service import SearchService, SearchResponse
 from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from market_analyzer import MarketAnalyzer
+from user_manager import UserManager
 
 # 配置日志格式
 LOG_FORMAT = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
@@ -166,6 +185,12 @@ class StockAnalysisPipeline:
             serpapi_keys=self.config.serpapi_keys,
         )
         
+        # 初始化用户管理器
+        self.user_manager = UserManager()
+        if self.user_manager.has_users():
+            logger.info(f"已启用多用户模式，加载了 {len(self.user_manager.users)} 个用户配置")
+        
+        
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
         if self.search_service.is_available:
@@ -254,6 +279,16 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.warning(f"[{code}] 获取实时行情失败: {e}")
             
+            # 如果从实时行情获取名称失败，尝试使用专用接口获取
+            if not stock_name and realtime_quote is None:
+                try:
+                    fetched_name = self.akshare_fetcher.get_stock_name(code)
+                    if fetched_name:
+                        stock_name = fetched_name
+                        logger.info(f"[{code}] 通过辅助接口获取到名称: {stock_name}")
+                except Exception as e:
+                     logger.warning(f"[{code}] 辅助接口获取名称失败: {e}")
+
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
                 stock_name = f'股票{code}'
@@ -506,7 +541,16 @@ class StockAnalysisPipeline:
         
         # 使用配置中的股票列表
         if stock_codes is None:
-            stock_codes = self.config.stock_list
+            # 基础自选股列表
+            codes = set(self.config.stock_list)
+            
+            # 如果有多用户配置，合并用户关注的股票
+            if self.user_manager.has_users():
+                user_stocks = self.user_manager.get_all_stocks()
+                codes.update(user_stocks)
+                logger.info(f"合并用户关注股票后，共 {len(codes)} 只股票")
+                
+            stock_codes = list(codes)
         
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
@@ -603,7 +647,30 @@ class StockAnalysisPipeline:
                     elif channel == NotificationChannel.TELEGRAM:
                         non_wechat_success = self.notifier.send_to_telegram(report) or non_wechat_success
                     elif channel == NotificationChannel.EMAIL:
-                        non_wechat_success = self.notifier.send_to_email(report) or non_wechat_success
+                        # 如果有多用户配置，发送个性化分析报告
+                        if self.user_manager.has_users():
+                            logger.info("正在发送个性化邮件通知...")
+                            for user in self.user_manager.get_users():
+                                # 筛选该用户关注的股票结果
+                                user_results = [r for r in results if r.code in user.stocks]
+                                if not user_results:
+                                    continue
+                                    
+                                logger.info(f"向 {user.name} ({user.email}) 发送报告，包含 {len(user_results)} 只股票")
+                                # 生成用户专属报告
+                                user_report = self.notifier.generate_dashboard_report(user_results)
+                                # 发送邮件
+                                self.notifier.send_to_email(user_report, receivers=[user.email])
+                            
+                            # 同时也向配置文件中的默认收件人（管理员）发送全量报告
+                            if self.config.email_receivers:
+                                logger.info("正在向默认收件人（管理员）发送全量分析报告...")
+                                self.notifier.send_to_email(report)
+                                
+                            non_wechat_success = True
+                        else:
+                            # 默认模式：发送给全局配置的收件人
+                            non_wechat_success = self.notifier.send_to_email(report) or non_wechat_success
                     elif channel == NotificationChannel.CUSTOM:
                         non_wechat_success = self.notifier.send_to_custom(report) or non_wechat_success
                     else:

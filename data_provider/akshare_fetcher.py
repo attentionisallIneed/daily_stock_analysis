@@ -24,8 +24,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any
+import os
 
 import pandas as pd
+import akshare as ak
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -257,6 +259,23 @@ class AkshareFetcher(BaseFetcher):
             logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
         except Exception as e:
             logger.debug(f"设置 User-Agent 失败: {e}")
+
+    from contextlib import contextmanager
+    import os
+
+    @contextmanager
+    def _without_proxy(self):
+        """
+        上下文管理器：(已弃用) 临时禁用系统代理
+        
+        由于多线程环境下修改 os.environ 会影响全局（导致 OpenAI/Telegram 代理失效），
+        因此改为在 main.py 中全局配置 no_proxy 环境变量来实现国内域名直连。
+        此方法保留为空实现，避免修改大量调用代码。
+        """
+        try:
+            yield
+        finally:
+            pass
     
     def _enforce_rate_limit(self) -> None:
         """
@@ -330,13 +349,14 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
             
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"  # 前复权
-            )
+            with self._without_proxy():
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq"  # 前复权
+                )
             
             api_elapsed = _time.time() - api_start
             
@@ -391,13 +411,14 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             # 调用 akshare 获取 ETF 日线数据
-            df = ak.fund_etf_hist_em(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"  # 前复权
-            )
+            with self._without_proxy():
+                df = ak.fund_etf_hist_em(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq"  # 前复权
+                )
             
             api_elapsed = _time.time() - api_start
             
@@ -504,7 +525,8 @@ class AkshareFetcher(BaseFetcher):
                 import time as _time
                 api_start = _time.time()
                 
-                df = ak.stock_zh_a_spot_em()
+                with self._without_proxy():
+                    df = ak.stock_zh_a_spot_em()
                 
                 api_elapsed = _time.time() - api_start
                 logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
@@ -588,7 +610,8 @@ class AkshareFetcher(BaseFetcher):
                 import time as _time
                 api_start = _time.time()
                 
-                df = ak.fund_etf_spot_em()
+                with self._without_proxy():
+                    df = ak.fund_etf_spot_em()
                 
                 api_elapsed = _time.time() - api_start
                 logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
@@ -672,7 +695,8 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
             
-            df = ak.stock_cyq_em(symbol=stock_code)
+            with self._without_proxy():
+                df = ak.stock_cyq_em(symbol=stock_code)
             
             api_elapsed = _time.time() - api_start
             
@@ -748,6 +772,36 @@ class AkshareFetcher(BaseFetcher):
         result['chip_distribution'] = self.get_chip_distribution(stock_code)
         
         return result
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+           retry=retry_if_exception_type((Exception,)))
+    def get_stock_name(self, stock_code: str) -> str:
+        """
+        获取股票名称（轻量级接口，用于补全信息）
+        """
+        try:
+            with self._without_proxy():
+                # 尝试使用专用接口获取名称
+                name_df = ak.stock_info_a_code_name()
+                if name_df is not None and not name_df.empty:
+                    # 过滤出对应代码
+                    # 注意：该接口返回的 DataFrame 列名为 'code', 'name' 或 '股票代码', '股票名称'
+                    # akshare 接口变动频繁，使用模糊匹配
+                    code_col = next((c for c in name_df.columns if 'code' in c.lower() or '代码' in c), None)
+                    name_col = next((c for c in name_df.columns if 'name' in c.lower() or '名称' in c), None)
+                    
+                    if code_col and name_col:
+                         row = name_df[name_df[code_col] == stock_code]
+                         if not row.empty:
+                             name = row.iloc[0][name_col]
+                             if name:
+                                 return str(name)
+
+            # 如果专用接口失败，返回空字符串，由上层处理默认值
+            return ""
+        except Exception as e:
+            logger.warning(f"[API错误] 获取 {stock_code} 名称失败: {e}")
+            return ""
 
 
 if __name__ == "__main__":

@@ -391,16 +391,11 @@ class MarketAnalyzer:
             }
             
             # 根据 analyzer 使用的 API 类型调用
-            if self.analyzer._use_openai:
-                # 使用 OpenAI 兼容 API
-                review = self.analyzer._call_openai_api(prompt, generation_config)
-            else:
-                # 使用 Gemini API
-                response = self.analyzer._model.generate_content(
-                    prompt,
-                    generation_config=generation_config,
-                )
-                review = response.text.strip() if response and response.text else None
+            # 统一调用 AI 分析器接口
+            # analyzer.py 中的 GeminiAnalyzer 已经封装了 _call_api_with_retry 方法
+            # 且目前只支持 OpenAI 兼容接口，因此直接调用即可
+            
+            review = self.analyzer._call_api_with_retry(prompt, generation_config)
             
             if review:
                 logger.info(f"[大盘] 复盘报告生成成功，长度: {len(review)} 字符")
