@@ -99,6 +99,14 @@ class TrendAnalysisResult:
     # 支撑压力
     support_ma5: bool = False        # MA5 是否构成支撑
     support_ma10: bool = False       # MA10 是否构成支撑
+    ma5_touch_reclaim: bool = False  # 盘中触及/跌破 MA5 后收回
+    ma10_touch_reclaim: bool = False # 盘中触及/跌破 MA10 后收回
+    bullish_candle: bool = False     # 当日阳线确认
+    lower_shadow_ratio: float = 0.0  # 下影线占全日振幅比例（%）
+    ma5_hold_days: int = 0           # 连续未跌破 MA5 的天数
+    ma10_hold_days: int = 0          # 连续未跌破 MA10 的天数
+    ma20_breakdown: bool = False     # 收盘跌破 MA20
+    support_confirmation: str = ""
     resistance_levels: List[float] = field(default_factory=list)
     support_levels: List[float] = field(default_factory=list)
     
@@ -151,6 +159,14 @@ class TrendAnalysisResult:
             'adaptive_support_tolerance': self.adaptive_support_tolerance,
             'support_ma5': self.support_ma5,
             'support_ma10': self.support_ma10,
+            'ma5_touch_reclaim': self.ma5_touch_reclaim,
+            'ma10_touch_reclaim': self.ma10_touch_reclaim,
+            'bullish_candle': self.bullish_candle,
+            'lower_shadow_ratio': self.lower_shadow_ratio,
+            'ma5_hold_days': self.ma5_hold_days,
+            'ma10_hold_days': self.ma10_hold_days,
+            'ma20_breakdown': self.ma20_breakdown,
+            'support_confirmation': self.support_confirmation,
             'support_levels': self.support_levels,
             'resistance_levels': self.resistance_levels,
             'buy_signal': self.buy_signal.value,
@@ -193,6 +209,8 @@ class StockTrendAnalyzer:
     VOLUME_HEAVY_RATIO = 1.5    # 放量判断阈值
     MA_SUPPORT_TOLERANCE = 0.02  # MA 支撑判断容忍度（2%）
     MIN_SUPPORT_TOLERANCE = 0.01  # 低波动标的支撑容忍度下限（1%）
+    LOWER_SHADOW_CONFIRM_RATIO = 35.0
+    SUPPORT_HOLD_DAYS = 2
     ACCOUNT_RISK_BUDGET_PCT = 1.0  # 单票单次交易最大组合亏损预算（%）
     MAX_POSITION_PCT = 30.0
     MARKET_POSITION_MULTIPLIERS = {
@@ -541,33 +559,87 @@ class StockTrendAnalyzer:
         
         买点偏好：回踩 MA5/MA10 获得支撑
         """
+        latest = df.iloc[-1]
+        open_price = self._to_float(latest.get('open'))
+        high = self._to_float(latest.get('high'))
+        low = self._to_float(latest.get('low'))
         price = result.current_price
         support_tolerance = result.adaptive_support_tolerance or self.MA_SUPPORT_TOLERANCE
-        
+
+        candle_range = high - low
+        if candle_range > 0:
+            lower_shadow = max(min(open_price, price) - low, 0.0)
+            result.lower_shadow_ratio = round(lower_shadow / candle_range * 100, 2)
+        result.bullish_candle = price > open_price
+        result.ma5_hold_days = self._count_ma_hold_days(df, 'MA5')
+        result.ma10_hold_days = self._count_ma_hold_days(df, 'MA10')
+        result.ma20_breakdown = result.ma20 > 0 and price < result.ma20
+
+        confirmation_notes = []
+        if result.bullish_candle:
+            confirmation_notes.append("阳线确认")
+        if result.lower_shadow_ratio >= self.LOWER_SHADOW_CONFIRM_RATIO:
+            confirmation_notes.append(f"下影线承接({result.lower_shadow_ratio:.1f}%)")
+
         # 检查是否在 MA5 附近获得支撑
         if result.ma5 > 0:
             ma5_distance = abs(price - result.ma5) / result.ma5
-            if ma5_distance <= support_tolerance and price >= result.ma5:
+            result.ma5_touch_reclaim = low <= result.ma5 <= price
+            ma5_hold_confirmed = result.ma5_hold_days >= self.SUPPORT_HOLD_DAYS
+            ma5_candle_confirmed = result.bullish_candle or result.lower_shadow_ratio >= self.LOWER_SHADOW_CONFIRM_RATIO
+            if ma5_distance <= support_tolerance and price >= result.ma5 and (
+                result.ma5_touch_reclaim or ma5_hold_confirmed or ma5_candle_confirmed
+            ):
                 result.support_ma5 = True
                 result.support_levels.append(result.ma5)
+                if result.ma5_touch_reclaim:
+                    confirmation_notes.append("回踩MA5后收回")
+                elif ma5_hold_confirmed:
+                    confirmation_notes.append(f"连续{result.ma5_hold_days}日守住MA5")
         
         # 检查是否在 MA10 附近获得支撑
         if result.ma10 > 0:
             ma10_distance = abs(price - result.ma10) / result.ma10
-            if ma10_distance <= support_tolerance and price >= result.ma10:
+            result.ma10_touch_reclaim = low <= result.ma10 <= price
+            ma10_hold_confirmed = result.ma10_hold_days >= self.SUPPORT_HOLD_DAYS
+            ma10_candle_confirmed = result.bullish_candle or result.lower_shadow_ratio >= self.LOWER_SHADOW_CONFIRM_RATIO
+            if ma10_distance <= support_tolerance and price >= result.ma10 and (
+                result.ma10_touch_reclaim or ma10_hold_confirmed or ma10_candle_confirmed
+            ):
                 result.support_ma10 = True
                 if result.ma10 not in result.support_levels:
                     result.support_levels.append(result.ma10)
+                if result.ma10_touch_reclaim:
+                    confirmation_notes.append("回踩MA10后收回")
+                elif ma10_hold_confirmed:
+                    confirmation_notes.append(f"连续{result.ma10_hold_days}日守住MA10")
         
         # MA20 作为重要支撑
         if result.ma20 > 0 and price >= result.ma20:
             result.support_levels.append(result.ma20)
+        elif result.ma20_breakdown:
+            confirmation_notes.append("收盘跌破MA20")
+
+        result.support_confirmation = "；".join(dict.fromkeys(confirmation_notes)) or "暂无明确K线支撑确认"
         
         # 近期高点作为压力
         if len(df) >= 20:
             recent_high = df['high'].iloc[-20:].max()
             if recent_high > price:
                 result.resistance_levels.append(recent_high)
+
+    def _count_ma_hold_days(self, df: pd.DataFrame, ma_column: str, days: int = 3) -> int:
+        """统计最近连续几个交易日的最低价没有跌破指定均线。"""
+        count = 0
+        for _, row in df.tail(days).iloc[::-1].iterrows():
+            ma_value = self._to_float(row.get(ma_column))
+            low = self._to_float(row.get('low'))
+            close = self._to_float(row.get('close'))
+            if ma_value > 0 and close >= ma_value and low >= ma_value:
+                count += 1
+            else:
+                break
+        return count
     
     def _calculate_trade_plan(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """计算规则层买点、止损、目标位和盈亏比。"""
@@ -699,10 +771,18 @@ class StockTrendAnalyzer:
         # === 支撑评分（10分）===
         if result.support_ma5:
             score += 5
-            reasons.append("✅ MA5支撑有效")
+            reasons.append("✅ MA5支撑有效（K线确认）")
         if result.support_ma10:
             score += 5
-            reasons.append("✅ MA10支撑有效")
+            reasons.append("✅ MA10支撑有效（K线确认）")
+
+        if result.current_price < result.ma5 and not (result.support_ma5 or result.support_ma10):
+            score = min(score, 64)
+            risks.append("⚠️ 回踩均线但尚未出现K线支撑确认，等待收回均线")
+
+        if result.ma20_breakdown:
+            score = min(score, 49)
+            risks.append("⚠️ 收盘跌破MA20，买入信号失效或降级")
 
         if result.ma60_trend:
             if result.medium_trend_risk:
@@ -770,6 +850,7 @@ class StockTrendAnalyzer:
             f"   ATR20: {result.atr_20:.2f} ({result.atr_pct:.2f}%), "
             f"追高线: {result.adaptive_bias_threshold:.2f}%, "
             f"支撑容忍: {result.adaptive_support_tolerance * 100:.2f}%",
+            f"   K线确认: {result.support_confirmation}",
             f"",
             f"📊 量能分析: {result.volume_status.value}",
             f"   量比(vs5日): {result.volume_ratio_5d:.2f}",

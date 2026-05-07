@@ -3,13 +3,14 @@ import pandas as pd
 from stock_analyzer import BuySignal, StockTrendAnalyzer, TrendAnalysisResult
 
 
-def _make_df(closes, highs=None, lows=None):
+def _make_df(closes, highs=None, lows=None, opens=None):
     highs = highs or [price * 1.02 for price in closes]
     lows = lows or [price * 0.98 for price in closes]
+    opens = opens or closes
     return pd.DataFrame(
         {
             "date": pd.date_range("2025-01-01", periods=len(closes), freq="D"),
-            "open": closes,
+            "open": opens,
             "high": highs,
             "low": lows,
             "close": closes,
@@ -84,6 +85,56 @@ def test_atr_stop_tightens_rule_stop_for_low_volatility_stock():
     assert result.stop_loss == atr_stop
     assert result.stop_loss > round(result.ma20 * 0.98, 2)
     assert "ATR" in result.invalidation_condition
+
+
+def test_kline_reclaim_confirms_ma5_support():
+    closes = [10.0] * 79 + [10.05]
+    opens = [10.0] * 79 + [9.98]
+    highs = [10.04] * 79 + [10.08]
+    lows = [9.98] * 79 + [9.96]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(closes, highs=highs, lows=lows, opens=opens),
+        "000001",
+    )
+
+    assert result.support_ma5 is True
+    assert result.ma5_touch_reclaim is True
+    assert result.bullish_candle is True
+    assert "回踩MA5后收回" in result.support_confirmation
+
+
+def test_near_ma5_without_kline_confirmation_does_not_count_as_support():
+    closes = [10.0] * 79 + [9.95]
+    opens = [10.0] * 79 + [10.02]
+    highs = [10.04] * 79 + [10.03]
+    lows = [9.98] * 79 + [9.94]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(closes, highs=highs, lows=lows, opens=opens),
+        "000001",
+    )
+
+    assert result.support_ma5 is False
+    assert result.signal_score <= 64
+    assert any("尚未出现K线支撑确认" in risk for risk in result.risk_factors)
+
+
+def test_ma20_breakdown_downgrades_buy_signal():
+    closes = [10.0] * 79 + [9.5]
+    opens = [10.0] * 79 + [9.8]
+    highs = [10.04] * 79 + [9.85]
+    lows = [9.98] * 79 + [9.45]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(closes, highs=highs, lows=lows, opens=opens),
+        "000001",
+    )
+
+    assert result.ma20_breakdown is True
+    assert result.signal_score <= 49
+    assert result.buy_signal not in {BuySignal.BUY, BuySignal.STRONG_BUY}
+    assert any("跌破MA20" in risk for risk in result.risk_factors)
 
 
 def test_position_model_generates_rule_position_from_market_and_risk_reward():

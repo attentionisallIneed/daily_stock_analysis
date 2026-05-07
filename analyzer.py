@@ -724,6 +724,8 @@ class OpenAIAnalyzer:
             bias_threshold = float(trend.get('adaptive_bias_threshold') or 5)
             support_tolerance_pct = float(trend.get('adaptive_support_tolerance') or 0.02) * 100
             bias_warning = f"🚨 超过{bias_threshold:.2f}%，严禁追高！" if bias_ma5 > bias_threshold else "✅ 安全范围"
+            support_confirmation = trend.get('support_confirmation') or '暂无明确K线支撑确认'
+            ma20_breakdown_text = '是' if trend.get('ma20_breakdown') else '否'
             support_levels = trend.get('support_levels') or []
             resistance_levels = trend.get('resistance_levels') or []
             support_text = ', '.join(f"{level:.2f}" for level in support_levels[:3]) if support_levels else '无'
@@ -743,6 +745,12 @@ class OpenAIAnalyzer:
 | 20日收益波动率 | {trend.get('volatility_20d', 0):.2f}% | 辅助识别波动环境 |
 | 自适应追高线 | {bias_threshold:.2f}% | 默认最高5%，低波动标的收紧 |
 | 自适应支撑容忍度 | {support_tolerance_pct:.2f}% | MA5/MA10支撑判定使用 |
+| MA5/MA10支撑确认 | {trend.get('support_ma5', False)} / {trend.get('support_ma10', False)} | 必须有K线确认才算有效支撑 |
+| 回踩收回MA5/MA10 | {trend.get('ma5_touch_reclaim', False)} / {trend.get('ma10_touch_reclaim', False)} | low<=均线且close>=均线 |
+| 阳线/下影线 | {trend.get('bullish_candle', False)} / {trend.get('lower_shadow_ratio', 0):.2f}% | 下影线表示承接 |
+| 连续守住MA5/MA10 | {trend.get('ma5_hold_days', 0)}日 / {trend.get('ma10_hold_days', 0)}日 | 连续未跌破关键均线 |
+| 是否跌破MA20 | {ma20_breakdown_text} | 跌破则买入信号失效或降级 |
+| K线支撑结论 | {support_confirmation} | |
 | 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
 | 规则支撑位 | {support_text} | 优先参考 MA5/MA10/MA20 附近支撑 |
 | 规则压力位 | {resistance_text} | 目标位优先参考近期压力 |
@@ -766,6 +774,7 @@ class OpenAIAnalyzer:
 - 若筹码获利比例过高且筹码分散，必须在 risk_warning 和 risk_alerts 中明确提示获利盘兑现风险。
 - 买点、止损、目标位、盈亏比必须使用规则层给出的数值，LLM 只解释来源，不得自行创造点位。
 - 若规则盈亏比 < 1.2，operation_advice 不得输出买入类建议；1.2-1.8 之间只能低仓试探。
+- 若收盘跌破 MA20，operation_advice 不得输出买入/加仓/强烈买入。
 - 仓位必须使用规则建议仓位；不得自行放大，规则建议仓位为0%时不得输出买入/加仓/强烈买入。
 - 若市场环境为偏弱/极弱，不得输出高置信度买入；极弱环境且个股非强势多头时，优先观望并降低仓位。
 
@@ -956,6 +965,7 @@ class OpenAIAnalyzer:
         single_trade_risk_pct = float(trend.get('single_trade_risk_pct') or 0)
         max_position_by_risk_pct = float(trend.get('max_position_by_risk_pct') or 0)
         bias_threshold = float(trend.get('adaptive_bias_threshold') or 5)
+        ma20_breakdown = bool(trend.get('ma20_breakdown'))
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -982,6 +992,13 @@ class OpenAIAnalyzer:
             result.sentiment_score = min(result.sentiment_score, 39)
             result.confidence_level = '中'
             warnings.append(f"趋势状态为{trend_status}，不允许买入类建议")
+
+        if ma20_breakdown and result.operation_advice in buy_advices:
+            result.operation_advice = '观望'
+            result.trend_prediction = '震荡'
+            result.sentiment_score = min(result.sentiment_score, 49)
+            result.confidence_level = '中'
+            warnings.append("收盘跌破MA20，买入信号失效或降级")
 
         if final_position_pct <= 0 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
