@@ -95,6 +95,19 @@ class TrendAnalysisResult:
     volatility_20d: float = 0.0       # 近20日收益率标准差（%）
     adaptive_bias_threshold: float = 5.0
     adaptive_support_tolerance: float = 0.02
+
+    # 相对强弱（RS）
+    relative_strength_period: int = 20
+    stock_return_20d: float = 0.0
+    benchmark_return_20d: float = 0.0
+    sector_return_20d: float = 0.0
+    stock_vs_benchmark: float = 0.0
+    stock_vs_sector: float = 0.0
+    sector_vs_benchmark: float = 0.0
+    relative_strength_score: int = 0
+    relative_strength_status: str = "未提供基准/行业数据"
+    relative_strength_summary: str = ""
+    sector_name: str = ""
     
     # 支撑压力
     support_ma5: bool = False        # MA5 是否构成支撑
@@ -157,6 +170,17 @@ class TrendAnalysisResult:
             'volatility_20d': self.volatility_20d,
             'adaptive_bias_threshold': self.adaptive_bias_threshold,
             'adaptive_support_tolerance': self.adaptive_support_tolerance,
+            'relative_strength_period': self.relative_strength_period,
+            'stock_return_20d': self.stock_return_20d,
+            'benchmark_return_20d': self.benchmark_return_20d,
+            'sector_return_20d': self.sector_return_20d,
+            'stock_vs_benchmark': self.stock_vs_benchmark,
+            'stock_vs_sector': self.stock_vs_sector,
+            'sector_vs_benchmark': self.sector_vs_benchmark,
+            'relative_strength_score': self.relative_strength_score,
+            'relative_strength_status': self.relative_strength_status,
+            'relative_strength_summary': self.relative_strength_summary,
+            'sector_name': self.sector_name,
             'support_ma5': self.support_ma5,
             'support_ma10': self.support_ma10,
             'ma5_touch_reclaim': self.ma5_touch_reclaim,
@@ -211,6 +235,10 @@ class StockTrendAnalyzer:
     MIN_SUPPORT_TOLERANCE = 0.01  # 低波动标的支撑容忍度下限（1%）
     LOWER_SHADOW_CONFIRM_RATIO = 35.0
     SUPPORT_HOLD_DAYS = 2
+    RELATIVE_STRENGTH_PERIOD = 20
+    RS_OUTPERFORM_THRESHOLD = 3.0
+    RS_UNDERPERFORM_THRESHOLD = -3.0
+    RS_SECTOR_THRESHOLD = 2.0
     ACCOUNT_RISK_BUDGET_PCT = 1.0  # 单票单次交易最大组合亏损预算（%）
     MAX_POSITION_PCT = 30.0
     MARKET_POSITION_MULTIPLIERS = {
@@ -225,13 +253,23 @@ class StockTrendAnalyzer:
         """初始化分析器"""
         pass
     
-    def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+    def analyze(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        benchmark_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
+        sector_name: str = "",
+    ) -> TrendAnalysisResult:
         """
         分析股票趋势
         
         Args:
             df: 包含 OHLCV 数据的 DataFrame
             code: 股票代码
+            benchmark_df: 可选的大盘/宽基指数日线数据，用于计算相对大盘强弱
+            sector_df: 可选的行业/板块日线数据，用于计算相对行业强弱
+            sector_name: 可选的行业/板块名称
             
         Returns:
             TrendAnalysisResult 分析结果
@@ -264,6 +302,15 @@ class StockTrendAnalyzer:
 
         # 2. 乖离率计算
         self._calculate_bias(result)
+
+        # 2.5 相对强弱分析
+        self._analyze_relative_strength(
+            df,
+            result,
+            benchmark_df=benchmark_df,
+            sector_df=sector_df,
+            sector_name=sector_name,
+        )
         
         # 3. 量能分析
         self._analyze_volume(df, result)
@@ -418,6 +465,89 @@ class StockTrendAnalyzer:
         else:
             result.adaptive_bias_threshold = self.BIAS_THRESHOLD
             result.adaptive_support_tolerance = self.MA_SUPPORT_TOLERANCE
+
+    def _analyze_relative_strength(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+        benchmark_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
+        sector_name: str = "",
+    ) -> None:
+        """计算个股相对大盘/行业的 20 日强弱。"""
+        result.relative_strength_period = self.RELATIVE_STRENGTH_PERIOD
+        result.sector_name = sector_name or ""
+
+        stock_return = self._period_return_pct(df, self.RELATIVE_STRENGTH_PERIOD)
+        if stock_return is None:
+            result.relative_strength_status = "个股历史数据不足，无法计算RS"
+            result.relative_strength_summary = result.relative_strength_status
+            return
+
+        result.stock_return_20d = round(stock_return, 2)
+        score = 0
+        notes = [f"个股近{self.RELATIVE_STRENGTH_PERIOD}日收益{result.stock_return_20d:+.2f}%"]
+
+        benchmark_return = self._period_return_pct(benchmark_df, self.RELATIVE_STRENGTH_PERIOD)
+        if benchmark_return is not None:
+            result.benchmark_return_20d = round(benchmark_return, 2)
+            result.stock_vs_benchmark = round(stock_return - benchmark_return, 2)
+            notes.append(f"相对大盘{result.stock_vs_benchmark:+.2f}pct")
+            if result.stock_vs_benchmark >= self.RS_OUTPERFORM_THRESHOLD:
+                score += 5
+            elif result.stock_vs_benchmark <= self.RS_UNDERPERFORM_THRESHOLD:
+                score -= 5
+
+        sector_return = self._period_return_pct(sector_df, self.RELATIVE_STRENGTH_PERIOD)
+        if sector_return is not None:
+            result.sector_return_20d = round(sector_return, 2)
+            result.stock_vs_sector = round(stock_return - sector_return, 2)
+            sector_label = result.sector_name or "行业"
+            notes.append(f"相对{sector_label}{result.stock_vs_sector:+.2f}pct")
+            if result.stock_vs_sector >= self.RS_SECTOR_THRESHOLD:
+                score += 3
+            elif result.stock_vs_sector <= -self.RS_SECTOR_THRESHOLD:
+                score -= 4
+
+            if benchmark_return is not None:
+                result.sector_vs_benchmark = round(sector_return - benchmark_return, 2)
+                notes.append(f"{sector_label}相对大盘{result.sector_vs_benchmark:+.2f}pct")
+                if result.sector_vs_benchmark >= self.RS_SECTOR_THRESHOLD:
+                    score += 2
+                elif result.sector_vs_benchmark <= -self.RS_SECTOR_THRESHOLD:
+                    score -= 2
+
+        result.relative_strength_score = max(-10, min(10, score))
+
+        if benchmark_return is None and sector_return is None:
+            result.relative_strength_status = "未提供基准/行业数据"
+        elif result.relative_strength_score >= 6:
+            result.relative_strength_status = "明显强于基准/行业"
+        elif result.relative_strength_score >= 2:
+            result.relative_strength_status = "相对偏强"
+        elif result.relative_strength_score <= -6:
+            result.relative_strength_status = "明显弱于基准/行业"
+        elif result.relative_strength_score <= -2:
+            result.relative_strength_status = "相对偏弱"
+        else:
+            result.relative_strength_status = "相对中性"
+
+        result.relative_strength_summary = "；".join(notes)
+
+    def _period_return_pct(self, df: Optional[pd.DataFrame], period: int) -> Optional[float]:
+        """计算最近 period 个交易日的收盘收益率。"""
+        if df is None or df.empty or 'close' not in df.columns or len(df) <= period:
+            return None
+
+        working = df.copy()
+        if 'date' in working.columns:
+            working = working.sort_values('date')
+
+        latest_close = self._to_float(working['close'].iloc[-1])
+        base_close = self._to_float(working['close'].iloc[-period - 1])
+        if latest_close <= 0 or base_close <= 0:
+            return None
+        return (latest_close - base_close) / base_close * 100
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -776,6 +906,22 @@ class StockTrendAnalyzer:
             score += 5
             reasons.append("✅ MA10支撑有效（K线确认）")
 
+        # === 相对强弱评分（-10~+10分）===
+        if result.relative_strength_score > 0:
+            score += result.relative_strength_score
+            reasons.append(
+                f"✅ 相对强弱{result.relative_strength_status}"
+                f"（RS {result.relative_strength_score:+d}）：{result.relative_strength_summary}"
+            )
+        elif result.relative_strength_score < 0:
+            score += result.relative_strength_score
+            risks.append(
+                f"⚠️ 相对强弱{result.relative_strength_status}"
+                f"（RS {result.relative_strength_score:+d}）：{result.relative_strength_summary}"
+            )
+            if result.relative_strength_score <= -6:
+                score = min(score, 64)
+
         if result.current_price < result.ma5 and not (result.support_ma5 or result.support_ma10):
             score = min(score, 64)
             risks.append("⚠️ 回踩均线但尚未出现K线支撑确认，等待收回均线")
@@ -805,18 +951,18 @@ class StockTrendAnalyzer:
                 reasons.append(f"✅ 盈亏比{result.risk_reward_ratio:.2f}，具备交易空间")
 
         # === 综合判断 ===
-        result.signal_score = score
+        result.signal_score = max(0, min(100, score))
         result.signal_reasons = reasons
         result.risk_factors = risks
         
         # 生成买入信号
-        if score >= 80 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+        if result.signal_score >= 80 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
             result.buy_signal = BuySignal.STRONG_BUY
-        elif score >= 65 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+        elif result.signal_score >= 65 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
             result.buy_signal = BuySignal.BUY
-        elif score >= 50:
+        elif result.signal_score >= 50:
             result.buy_signal = BuySignal.HOLD
-        elif score >= 35:
+        elif result.signal_score >= 35:
             result.buy_signal = BuySignal.WAIT
         elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
             result.buy_signal = BuySignal.STRONG_SELL
@@ -850,6 +996,11 @@ class StockTrendAnalyzer:
             f"   ATR20: {result.atr_20:.2f} ({result.atr_pct:.2f}%), "
             f"追高线: {result.adaptive_bias_threshold:.2f}%, "
             f"支撑容忍: {result.adaptive_support_tolerance * 100:.2f}%",
+            f"   相对强弱: {result.relative_strength_status} "
+            f"(个股{result.stock_return_20d:+.2f}%, "
+            f"相对大盘{result.stock_vs_benchmark:+.2f}pct, "
+            f"相对行业{result.stock_vs_sector:+.2f}pct, "
+            f"RS {result.relative_strength_score:+d})",
             f"   K线确认: {result.support_confirmation}",
             f"",
             f"📊 量能分析: {result.volume_status.value}",

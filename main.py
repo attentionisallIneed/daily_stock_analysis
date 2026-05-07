@@ -184,6 +184,8 @@ class StockAnalysisPipeline:
         self.analyzer = OpenAIAnalyzer()
         self.notifier = NotificationService()
         self._market_context: Optional[Dict[str, Any]] = None
+        self._benchmark_history = None
+        self._benchmark_history_loaded = False
         
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -288,6 +290,20 @@ class StockAnalysisPipeline:
 
         return self._market_context
 
+    def _get_benchmark_history(self):
+        """获取单轮运行内复用的宽基指数日线，用于个股相对强弱计算。"""
+        if self._benchmark_history_loaded:
+            return self._benchmark_history
+
+        try:
+            self._benchmark_history = self.akshare_fetcher.get_index_daily_data("000300", days=250)
+            logger.info("[RS] 已获取沪深300指数日线作为相对强弱基准")
+        except Exception as e:
+            logger.warning(f"[RS] 获取沪深300基准日线失败，跳过相对大盘强弱计算: {e}")
+            self._benchmark_history = None
+        self._benchmark_history_loaded = True
+        return self._benchmark_history
+
     def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
@@ -357,9 +373,15 @@ class StockAnalysisPipeline:
                     raw_data = context['raw_data']
                     if isinstance(raw_data, list) and len(raw_data) > 0:
                         df = pd.DataFrame(raw_data)
-                        trend_result = self.trend_analyzer.analyze(df, code)
+                        benchmark_df = self._get_benchmark_history()
+                        trend_result = self.trend_analyzer.analyze(
+                            df,
+                            code,
+                            benchmark_df=benchmark_df,
+                        )
                         logger.info(f"[{code}] 趋势分析: {trend_result.trend_status.value}, "
-                                  f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
+                                  f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}, "
+                                  f"RS={trend_result.relative_strength_status}")
             except Exception as e:
                 logger.warning(f"[{code}] 趋势分析失败: {e}")
             
@@ -518,6 +540,17 @@ class StockAnalysisPipeline:
                 'volatility_20d': trend_result.volatility_20d,
                 'adaptive_bias_threshold': trend_result.adaptive_bias_threshold,
                 'adaptive_support_tolerance': trend_result.adaptive_support_tolerance,
+                'relative_strength_period': trend_result.relative_strength_period,
+                'stock_return_20d': trend_result.stock_return_20d,
+                'benchmark_return_20d': trend_result.benchmark_return_20d,
+                'sector_return_20d': trend_result.sector_return_20d,
+                'stock_vs_benchmark': trend_result.stock_vs_benchmark,
+                'stock_vs_sector': trend_result.stock_vs_sector,
+                'sector_vs_benchmark': trend_result.sector_vs_benchmark,
+                'relative_strength_score': trend_result.relative_strength_score,
+                'relative_strength_status': trend_result.relative_strength_status,
+                'relative_strength_summary': trend_result.relative_strength_summary,
+                'sector_name': trend_result.sector_name,
                 'buy_signal': trend_result.buy_signal.value,
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,

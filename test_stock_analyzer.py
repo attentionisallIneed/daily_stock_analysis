@@ -87,6 +87,50 @@ def test_atr_stop_tightens_rule_stop_for_low_volatility_stock():
     assert "ATR" in result.invalidation_condition
 
 
+def test_relative_strength_compares_stock_to_benchmark_and_sector():
+    stock_closes = [10.0] * 59 + [10.0 + i * 0.1 for i in range(21)]
+    benchmark_closes = [10.0] * 80
+    sector_closes = [10.0] * 59 + [10.0 + i * 0.05 for i in range(21)]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(stock_closes),
+        "000001",
+        benchmark_df=_make_df(benchmark_closes),
+        sector_df=_make_df(sector_closes),
+        sector_name="测试行业",
+    )
+
+    assert result.stock_return_20d == 20.0
+    assert result.benchmark_return_20d == 0.0
+    assert result.sector_return_20d == 10.0
+    assert result.stock_vs_benchmark == 20.0
+    assert result.stock_vs_sector == 10.0
+    assert result.sector_vs_benchmark == 10.0
+    assert result.relative_strength_score == 10
+    assert result.relative_strength_status == "明显强于基准/行业"
+    assert "测试行业" in result.relative_strength_summary
+    assert result.to_dict()["relative_strength_score"] == 10
+
+
+def test_weak_relative_strength_caps_buy_score():
+    stock_closes = [10.0] * 80
+    benchmark_closes = [10.0] * 59 + [10.0 + i * 0.1 for i in range(21)]
+    sector_closes = [10.0] * 59 + [10.0 + i * 0.08 for i in range(21)]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(stock_closes),
+        "000001",
+        benchmark_df=_make_df(benchmark_closes),
+        sector_df=_make_df(sector_closes),
+        sector_name="测试行业",
+    )
+
+    assert result.relative_strength_score <= -6
+    assert result.relative_strength_status == "明显弱于基准/行业"
+    assert result.signal_score <= 64
+    assert any("相对强弱" in risk for risk in result.risk_factors)
+
+
 def test_kline_reclaim_confirms_ma5_support():
     closes = [10.0] * 79 + [10.05]
     opens = [10.0] * 79 + [9.98]

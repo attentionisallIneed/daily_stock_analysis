@@ -22,7 +22,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import os
 
@@ -500,6 +500,56 @@ class AkshareFetcher(BaseFetcher):
         df = df[existing_cols]
         
         return df
+
+    def get_index_daily_data(
+        self,
+        index_code: str = "000300",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 250,
+    ) -> pd.DataFrame:
+        """
+        获取 A 股指数日线数据，用于相对强弱基准。
+
+        默认使用沪深300（000300）作为宽基基准。返回字段与股票日线保持一致：
+        date, open, high, low, close, volume, amount, pct_chg。
+        """
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
+            start_date = start_dt.strftime("%Y-%m-%d")
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+
+        try:
+            logger.info(
+                f"[API调用] ak.index_zh_a_hist(symbol={index_code}, period=daily, "
+                f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')})"
+            )
+            with self._without_proxy():
+                raw_df = self._fetch_with_retry(
+                    "ak.index_zh_a_hist",
+                    lambda: ak.index_zh_a_hist(
+                        symbol=index_code,
+                        period="daily",
+                        start_date=start_date.replace("-", ""),
+                        end_date=end_date.replace("-", ""),
+                    ),
+                )
+
+            if raw_df is None or raw_df.empty:
+                raise DataFetchError(f"Akshare 未获取到指数 {index_code} 的日线数据")
+
+            df = self._normalize_data(raw_df, index_code)
+            df = self._clean_data(df)
+            df = self._calculate_indicators(df)
+            logger.info(f"[指数行情] {index_code} 获取成功，共 {len(df)} 条数据")
+            return df
+        except Exception as e:
+            logger.warning(f"[指数行情] 获取 {index_code} 失败: {e}")
+            raise DataFetchError(f"Akshare 获取指数数据失败: {e}") from e
     
     def get_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """

@@ -80,3 +80,33 @@ def test_hard_rules_block_buy_advice_after_ma20_breakdown():
     assert updated.operation_advice == "观望"
     assert updated.sentiment_score <= 49
     assert "跌破MA20" in updated.risk_warning
+
+
+def test_hard_rules_reduce_confidence_for_weak_relative_strength():
+    result = AnalysisResult(
+        code="000001",
+        name="test",
+        sentiment_score=82,
+        trend_prediction="看多",
+        operation_advice="买入",
+        confidence_level="高",
+        dashboard={"core_conclusion": {"position_advice": {}}},
+    )
+    context = {
+        "trend_analysis": {
+            "bias_ma5": 1.0,
+            "adaptive_bias_threshold": 5.0,
+            "trend_status": "多头排列",
+            "risk_reward_ratio": 2.0,
+            "final_position_pct": 20.0,
+            "relative_strength_score": -8,
+            "relative_strength_status": "明显弱于基准/行业",
+        }
+    }
+
+    updated = OpenAIAnalyzer._apply_hard_rules(object.__new__(OpenAIAnalyzer), result, context)
+
+    assert updated.operation_advice == "买入"
+    assert updated.sentiment_score <= 69
+    assert updated.confidence_level == "中"
+    assert "相对强弱明显弱于基准/行业" in updated.risk_warning

@@ -725,6 +725,11 @@ class OpenAIAnalyzer:
             support_tolerance_pct = float(trend.get('adaptive_support_tolerance') or 0.02) * 100
             bias_warning = f"🚨 超过{bias_threshold:.2f}%，严禁追高！" if bias_ma5 > bias_threshold else "✅ 安全范围"
             support_confirmation = trend.get('support_confirmation') or '暂无明确K线支撑确认'
+            rs_period = int(trend.get('relative_strength_period') or 20)
+            rs_status = trend.get('relative_strength_status') or '未提供基准/行业数据'
+            rs_summary = trend.get('relative_strength_summary') or '暂无相对强弱数据'
+            rs_score = int(float(trend.get('relative_strength_score') or 0))
+            sector_name = trend.get('sector_name') or '未提供'
             ma20_breakdown_text = '是' if trend.get('ma20_breakdown') else '否'
             support_levels = trend.get('support_levels') or []
             resistance_levels = trend.get('resistance_levels') or []
@@ -745,6 +750,9 @@ class OpenAIAnalyzer:
 | 20日收益波动率 | {trend.get('volatility_20d', 0):.2f}% | 辅助识别波动环境 |
 | 自适应追高线 | {bias_threshold:.2f}% | 默认最高5%，低波动标的收紧 |
 | 自适应支撑容忍度 | {support_tolerance_pct:.2f}% | MA5/MA10支撑判定使用 |
+| {rs_period}日个股/大盘/行业收益 | {trend.get('stock_return_20d', 0):+.2f}% / {trend.get('benchmark_return_20d', 0):+.2f}% / {trend.get('sector_return_20d', 0):+.2f}% | 行业：{sector_name} |
+| 相对大盘/相对行业 | {trend.get('stock_vs_benchmark', 0):+.2f}pct / {trend.get('stock_vs_sector', 0):+.2f}pct | 用于识别是否强于市场与所属行业 |
+| RS结论 | {rs_status}（RS {rs_score:+d}） | {rs_summary} |
 | MA5/MA10支撑确认 | {trend.get('support_ma5', False)} / {trend.get('support_ma10', False)} | 必须有K线确认才算有效支撑 |
 | 回踩收回MA5/MA10 | {trend.get('ma5_touch_reclaim', False)} / {trend.get('ma10_touch_reclaim', False)} | low<=均线且close>=均线 |
 | 阳线/下影线 | {trend.get('bullish_candle', False)} / {trend.get('lower_shadow_ratio', 0):.2f}% | 下影线表示承接 |
@@ -966,6 +974,8 @@ class OpenAIAnalyzer:
         max_position_by_risk_pct = float(trend.get('max_position_by_risk_pct') or 0)
         bias_threshold = float(trend.get('adaptive_bias_threshold') or 5)
         ma20_breakdown = bool(trend.get('ma20_breakdown'))
+        relative_strength_score = int(float(trend.get('relative_strength_score') or 0))
+        relative_strength_status = str(trend.get('relative_strength_status') or '')
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -999,6 +1009,12 @@ class OpenAIAnalyzer:
             result.sentiment_score = min(result.sentiment_score, 49)
             result.confidence_level = '中'
             warnings.append("收盘跌破MA20，买入信号失效或降级")
+
+        if relative_strength_score <= -6 and result.operation_advice in buy_advices:
+            result.sentiment_score = min(result.sentiment_score, 69)
+            if result.confidence_level == '高':
+                result.confidence_level = '中'
+            warnings.append(f"相对强弱{relative_strength_status}，不支持高置信度买入")
 
         if final_position_pct <= 0 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
