@@ -41,6 +41,7 @@ env/
 *.swp
 *.swo
 *~
+.claude/
 
 # 数据和日志
 data/
@@ -59,6 +60,5 @@ Thumbs.db
 .coverage
 htmlcov/
 
-docs/
 
 run.sh

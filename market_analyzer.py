@@ -19,11 +19,23 @@ from typing import Optional, Dict, Any, List
 
 import akshare as ak
 import pandas as pd
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from config import get_config
 from search_service import SearchService
 
 logger = logging.getLogger(__name__)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+def _call_akshare_with_retry(api_name: str, fetch_func):
+    logger.debug(f"[大盘API] 调用 {api_name}")
+    return fetch_func()
 
 
 @contextmanager
@@ -100,10 +112,120 @@ class MarketOverview:
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
     north_flow: float = 0.0             # 北向资金净流入（亿元）
-    
+
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'date': self.date,
+            'indices': [index.to_dict() for index in self.indices],
+            'up_count': self.up_count,
+            'down_count': self.down_count,
+            'flat_count': self.flat_count,
+            'limit_up_count': self.limit_up_count,
+            'limit_down_count': self.limit_down_count,
+            'total_amount': self.total_amount,
+            'north_flow': self.north_flow,
+            'top_sectors': self.top_sectors,
+            'bottom_sectors': self.bottom_sectors,
+        }
+
+
+def evaluate_market_environment(overview: MarketOverview) -> Dict[str, Any]:
+    """Evaluate market environment for stock-level trading discipline."""
+    score = 50
+    reasons = []
+
+    index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct != 0]
+    if index_changes:
+        avg_index_change = sum(index_changes) / len(index_changes)
+        if avg_index_change >= 1.0:
+            score += 18
+            reasons.append(f"主要指数平均上涨{avg_index_change:.2f}%")
+        elif avg_index_change >= 0.3:
+            score += 10
+            reasons.append(f"主要指数平均小幅上涨{avg_index_change:.2f}%")
+        elif avg_index_change <= -1.0:
+            score -= 20
+            reasons.append(f"主要指数平均下跌{avg_index_change:.2f}%")
+        elif avg_index_change <= -0.3:
+            score -= 10
+            reasons.append(f"主要指数平均小幅下跌{avg_index_change:.2f}%")
+        else:
+            reasons.append("主要指数整体震荡")
+    else:
+        avg_index_change = 0.0
+        reasons.append("主要指数数据不足，按中性处理")
+
+    active_count = overview.up_count + overview.down_count
+    if active_count > 0:
+        up_ratio = overview.up_count / active_count
+        if up_ratio >= 0.65:
+            score += 15
+            reasons.append(f"上涨家数占比{up_ratio:.0%}，市场赚钱效应较好")
+        elif up_ratio >= 0.55:
+            score += 8
+            reasons.append(f"上涨家数占比{up_ratio:.0%}，市场略偏强")
+        elif up_ratio <= 0.35:
+            score -= 18
+            reasons.append(f"上涨家数占比仅{up_ratio:.0%}，亏钱效应明显")
+        elif up_ratio <= 0.45:
+            score -= 8
+            reasons.append(f"上涨家数占比{up_ratio:.0%}，市场略偏弱")
+    else:
+        reasons.append("涨跌家数数据不足")
+
+    if overview.limit_up_count or overview.limit_down_count:
+        limit_diff = overview.limit_up_count - overview.limit_down_count
+        if limit_diff >= 30:
+            score += 10
+            reasons.append(f"涨停显著多于跌停({overview.limit_up_count}/{overview.limit_down_count})")
+        elif limit_diff <= -10:
+            score -= 12
+            reasons.append(f"跌停压力偏大({overview.limit_up_count}/{overview.limit_down_count})")
+
+    if overview.north_flow >= 30:
+        score += 6
+        reasons.append(f"北向资金净流入{overview.north_flow:.1f}亿")
+    elif overview.north_flow <= -30:
+        score -= 6
+        reasons.append(f"北向资金净流出{abs(overview.north_flow):.1f}亿")
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        market_status = "强势"
+        risk_level = "低"
+    elif score >= 60:
+        market_status = "偏强"
+        risk_level = "中"
+    elif score >= 45:
+        market_status = "震荡"
+        risk_level = "中"
+    elif score >= 30:
+        market_status = "偏弱"
+        risk_level = "高"
+    else:
+        market_status = "极弱"
+        risk_level = "高"
+
+    top_sectors = overview.top_sectors[:3]
+    bottom_sectors = overview.bottom_sectors[:3]
+    top_text = "、".join(s['name'] for s in top_sectors) if top_sectors else "无"
+    bottom_text = "、".join(s['name'] for s in bottom_sectors) if bottom_sectors else "无"
+
+    return {
+        'market_score': score,
+        'market_status': market_status,
+        'risk_level': risk_level,
+        'summary': f"市场环境{market_status}，风险等级{risk_level}",
+        'reasons': reasons,
+        'avg_index_change': avg_index_change,
+        'top_sectors': overview.top_sectors,
+        'bottom_sectors': overview.bottom_sectors,
+        'sector_heat_summary': f"领涨板块：{top_text}；领跌板块：{bottom_text}",
+    }
 
 
 class MarketAnalyzer:
@@ -173,7 +295,7 @@ class MarketAnalyzer:
             
             # 使用 akshare 获取指数行情
             with temporary_no_proxy():
-                df = ak.stock_zh_index_spot_em()
+                df = _call_akshare_with_retry("ak.stock_zh_index_spot_em", ak.stock_zh_index_spot_em)
             
             if df is not None and not df.empty:
                 for code, name in self.MAIN_INDICES.items():
@@ -217,7 +339,7 @@ class MarketAnalyzer:
             
             # 获取全部A股实时行情
             with temporary_no_proxy():
-                df = ak.stock_zh_a_spot_em()
+                df = _call_akshare_with_retry("ak.stock_zh_a_spot_em", ak.stock_zh_a_spot_em)
             
             if df is not None and not df.empty:
                 # 涨跌统计
@@ -252,7 +374,7 @@ class MarketAnalyzer:
             
             # 获取行业板块行情
             with temporary_no_proxy():
-                df = ak.stock_board_industry_name_em()
+                df = _call_akshare_with_retry("ak.stock_board_industry_name_em", ak.stock_board_industry_name_em)
             
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
@@ -290,10 +412,13 @@ class MarketAnalyzer:
             # 改用 stock_hsgt_fund_flow_summary_em
             with temporary_no_proxy():
                 try:
-                    df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+                    df = _call_akshare_with_retry(
+                        "ak.stock_hsgt_north_net_flow_in_em",
+                        lambda: ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+                    )
                 except AttributeError:
                     logger.warning("[大盘] akshare原接口不可用，尝试使用新接口...")
-                    df = ak.stock_hsgt_fund_flow_summary_em()
+                    df = _call_akshare_with_retry("ak.stock_hsgt_fund_flow_summary_em", ak.stock_hsgt_fund_flow_summary_em)
             
             if df is not None and not df.empty:
                 # 取最新一条数据
@@ -392,7 +517,7 @@ class MarketAnalyzer:
             
             # 根据 analyzer 使用的 API 类型调用
             # 统一调用 AI 分析器接口
-            # analyzer.py 中的 GeminiAnalyzer 已经封装了 _call_api_with_retry 方法
+            # analyzer.py 中的 OpenAIAnalyzer 已经封装了 _call_api_with_retry 方法
             # 且目前只支持 OpenAI 兼容接口，因此直接调用即可
             
             review = self.analyzer._call_api_with_retry(prompt, generation_config)

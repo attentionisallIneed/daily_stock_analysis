@@ -515,21 +515,25 @@ class SearchService:
         results = {}
         search_count = 0
         
+        now = datetime.now()
+        current_month = f"{now.year}年{now.month}月"
+        current_year = now.year
+
         # 定义搜索维度
         search_dimensions = [
             {
                 'name': 'latest_news',
-                'query': f"{stock_name} {stock_code} 最新 新闻 2026年1月",
+                'query': f"{stock_name} {stock_code} 最新 新闻 {current_month}",
                 'desc': '最新消息'
             },
             {
-                'name': 'risk_check', 
+                'name': 'risk_check',
                 'query': f"{stock_name} 减持 处罚 利空 风险",
                 'desc': '风险排查'
             },
             {
                 'name': 'earnings',
-                'query': f"{stock_name} 年报预告 业绩预告 业绩快报 2025年报",
+                'query': f"{stock_name} 年报预告 业绩预告 业绩快报 {current_year}年报",
                 'desc': '业绩预期'
             },
         ]

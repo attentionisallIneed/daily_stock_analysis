@@ -419,7 +419,13 @@ class DatabaseManager:
             'date': today_data.date.isoformat(),
             'today': today_data.to_dict(),
         }
-        
+
+        historical_data = self.get_latest_data(code, days=250)
+        context['raw_data'] = [
+            item.to_dict()
+            for item in sorted(historical_data, key=lambda x: x.date)
+        ]
+
         if yesterday_data:
             context['yesterday'] = yesterday_data.to_dict()
             

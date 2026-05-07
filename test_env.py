@@ -68,11 +68,11 @@ def test_config():
     if config.tushare_token:
         print(f"    Token 前8位: {config.tushare_token[:8]}...")
     
-    print(f"  Gemini API Key: {'已配置 ✓' if config.gemini_api_key else '未配置 ✗'}")
-    if config.gemini_api_key:
-        print(f"    Key 前8位: {config.gemini_api_key[:8]}...")
-    print(f"  Gemini 主模型: {config.gemini_model}")
-    print(f"  Gemini 备选模型: {config.gemini_model_fallback}")
+    print(f"  OpenAI API Key: {'已配置 ✓' if config.openai_api_key else '未配置 ✗'}")
+    if config.openai_api_key:
+        print(f"    Key 前8位: {config.openai_api_key[:8]}...")
+    print(f"  OpenAI Base URL: {config.openai_base_url or '未配置'}")
+    print(f"  OpenAI Model: {config.openai_model or '未配置'}")
     
     print(f"  企业微信 Webhook: {'已配置 ✓' if config.wechat_webhook_url else '未配置 ✗'}")
     
@@ -205,40 +205,30 @@ def test_data_fetch(stock_code: str = "600519"):
 
 def test_llm():
     """测试 LLM 调用"""
-    print_header("4. LLM (Gemini) 调用测试")
-    
-    from analyzer import GeminiAnalyzer
+    print_header("4. OpenAI 兼容 LLM 调用测试")
+
+    from analyzer import OpenAIAnalyzer
     from config import get_config
     import time
-    
+
     config = get_config()
-    
+
     print_section("模型配置")
-    print(f"  主模型: {config.gemini_model}")
-    print(f"  备选模型: {config.gemini_model_fallback}")
-    
-    # 检查网络连接
-    print_section("网络连接检查")
-    try:
-        import socket
-        socket.setdefaulttimeout(10)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("generativelanguage.googleapis.com", 443))
-        print(f"  ✓ 可以连接到 Google API 服务器")
-    except Exception as e:
-        print(f"  ✗ 无法连接到 Google API 服务器: {e}")
-        print(f"  提示: 请检查网络连接或配置代理")
-        print(f"  提示: 可以设置环境变量 HTTPS_PROXY=http://your-proxy:port")
-        return False
-    
-    analyzer = GeminiAnalyzer()
-    
+    print(f"  API Key: {'已配置 ✓' if config.openai_api_key else '未配置 ✗'}")
+    if config.openai_api_key:
+        print(f"    Key 前8位: {config.openai_api_key[:8]}...")
+    print(f"  Base URL: {config.openai_base_url or '未配置'}")
+    print(f"  Model: {config.openai_model or '未配置'}")
+
+    analyzer = OpenAIAnalyzer()
+
     print_section("模型初始化")
     if analyzer.is_available():
-        print(f"  ✓ 模型初始化成功")
+        print(f"  ✓ OpenAI 兼容客户端初始化成功")
     else:
-        print(f"  ✗ 模型初始化失败（请检查 API Key）")
+        print(f"  ✗ 模型初始化失败（请检查 OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL）")
         return False
-    
+
     # 构造测试上下文
     test_context = {
         'code': '600519',
@@ -263,7 +253,7 @@ def test_llm():
     
     print_section("发送测试请求")
     print(f"  测试股票: 贵州茅台 (600519)")
-    print(f"  正在调用 Gemini API（超时: 60秒）...")
+    print(f"  正在调用 OpenAI 兼容 API（超时: 120秒）...")
     
     start_time = time.time()
     
@@ -295,13 +285,13 @@ def test_llm():
         error_str = str(e).lower()
         if 'timeout' in error_str or 'unavailable' in error_str:
             print(f"\n  诊断: 网络超时，可能原因:")
-            print(f"    1. 网络不通（需要代理访问 Google）")
+            print(f"    1. 网络不通（可能需要代理访问配置的 OpenAI 兼容服务）")
             print(f"    2. API 服务暂时不可用")
             print(f"    3. 请求量过大被限流")
         elif 'invalid' in error_str or 'api key' in error_str:
             print(f"\n  诊断: API Key 可能无效")
         elif 'model' in error_str:
-            print(f"\n  诊断: 模型名称可能不正确，尝试修改 .env 中的 GEMINI_MODEL")
+            print(f"\n  诊断: 模型名称可能不正确，尝试修改 .env 中的 OPENAI_MODEL")
         
         return False
 
@@ -317,13 +307,13 @@ def test_notification():
     service = NotificationService()
     
     print_section("配置检查")
-    if service.is_available():
-        print(f"  ✓ 企业微信 Webhook 已配置")
-        webhook_preview = config.wechat_webhook_url[:50] + "..." if len(config.wechat_webhook_url) > 50 else config.wechat_webhook_url
-        print(f"    URL: {webhook_preview}")
-    else:
+    if not config.wechat_webhook_url:
         print(f"  ✗ 企业微信 Webhook 未配置")
         return False
+
+    print(f"  ✓ 企业微信 Webhook 已配置")
+    webhook_preview = config.wechat_webhook_url[:50] + "..." if len(config.wechat_webhook_url) > 50 else config.wechat_webhook_url
+    print(f"    URL: {webhook_preview}")
     
     print_section("发送测试消息")
     

@@ -22,8 +22,7 @@ pandas>=2.0.0               # 数据分析
 numpy>=1.24.0               # 数值计算
 
 # AI 分析
-google-generativeai>=0.8.0  # Gemini API
-openai>=1.0.0               # OpenAI 兼容 API（可选，支持 DeepSeek/通义千问等）
+openai>=1.0.0               # OpenAI 标准/兼容 API 主依赖
 
 # 搜索引擎（用于获取股票新闻）
 tavily-python>=0.3.0        # Tavily 搜索 API（每月 1000 次免费）
@@ -32,7 +31,7 @@ google-search-results>=2.4.0  # SerpAPI（每月 100 次免费）
 # 网络请求
 requests>=2.31.0            # HTTP 请求
 fake-useragent>=1.4.0       # 随机 User-Agent 防封禁
-httpx[socks]                # HTTP 客户端 + SOCKS 代理支持（OpenAI 可选依赖）
+httpx[socks]                # HTTP 客户端 + SOCKS 代理支持（OpenAI 客户端使用）
 
 # 数据库
 # SQLite 是 Python 内置，无需额外安装

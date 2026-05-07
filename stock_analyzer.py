@@ -79,6 +79,12 @@ class TrendAnalysisResult:
     bias_ma10: float = 0.0
     bias_ma20: float = 0.0
     
+    # 中期趋势
+    ma60_trend: str = ""              # MA60 趋势描述
+    price_vs_ma60: float = 0.0        # 现价相对 MA60 的偏离度
+    ma60_slope: float = 0.0           # MA60 近20日斜率百分比
+    medium_trend_risk: bool = False   # 中期趋势是否压制买入
+
     # 量能分析
     volume_status: VolumeStatus = VolumeStatus.NORMAL
     volume_ratio_5d: float = 0.0     # 当日成交量/5日均量
@@ -95,7 +101,16 @@ class TrendAnalysisResult:
     signal_score: int = 0            # 综合评分 0-100
     signal_reasons: List[str] = field(default_factory=list)
     risk_factors: List[str] = field(default_factory=list)
-    
+
+    # 规则层交易计划
+    ideal_buy: float = 0.0
+    secondary_buy: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    risk_reward_ratio: float = 0.0
+    invalidation_condition: str = ""
+    position_note: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'code': self.code,
@@ -110,15 +125,28 @@ class TrendAnalysisResult:
             'bias_ma5': self.bias_ma5,
             'bias_ma10': self.bias_ma10,
             'bias_ma20': self.bias_ma20,
+            'price_vs_ma60': self.price_vs_ma60,
+            'ma60_slope': self.ma60_slope,
+            'ma60_trend': self.ma60_trend,
+            'medium_trend_risk': self.medium_trend_risk,
             'volume_status': self.volume_status.value,
             'volume_ratio_5d': self.volume_ratio_5d,
             'volume_trend': self.volume_trend,
             'support_ma5': self.support_ma5,
             'support_ma10': self.support_ma10,
+            'support_levels': self.support_levels,
+            'resistance_levels': self.resistance_levels,
             'buy_signal': self.buy_signal.value,
             'signal_score': self.signal_score,
             'signal_reasons': self.signal_reasons,
             'risk_factors': self.risk_factors,
+            'ideal_buy': self.ideal_buy,
+            'secondary_buy': self.secondary_buy,
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'risk_reward_ratio': self.risk_reward_ratio,
+            'invalidation_condition': self.invalidation_condition,
+            'position_note': self.position_note,
         }
 
 
@@ -177,7 +205,8 @@ class StockTrendAnalyzer:
         
         # 1. 趋势判断
         self._analyze_trend(df, result)
-        
+        self._analyze_medium_trend(df, result)
+
         # 2. 乖离率计算
         self._calculate_bias(result)
         
@@ -186,8 +215,11 @@ class StockTrendAnalyzer:
         
         # 4. 支撑压力分析
         self._analyze_support_resistance(df, result)
-        
-        # 5. 生成买入信号
+
+        # 5. 规则层交易计划
+        self._calculate_trade_plan(df, result)
+
+        # 6. 生成买入信号
         self._generate_signal(result)
         
         return result
@@ -257,6 +289,32 @@ class StockTrendAnalyzer:
             result.ma_alignment = "均线缠绕，趋势不明"
             result.trend_strength = 50
     
+    def _analyze_medium_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析中期趋势状态
+
+        使用 MA60 约束短线买入信号，避免下降趋势中的短期反抽被误判为买点。
+        """
+        if result.ma60 <= 0:
+            result.ma60_trend = "MA60数据不足"
+            return
+
+        result.price_vs_ma60 = (result.current_price - result.ma60) / result.ma60 * 100
+
+        if len(df) >= 80 and df['MA60'].iloc[-20] > 0:
+            prev_ma60 = df['MA60'].iloc[-20]
+            result.ma60_slope = (result.ma60 - prev_ma60) / prev_ma60 * 100
+
+        if result.current_price < result.ma60 and result.ma60_slope < 0:
+            result.medium_trend_risk = True
+            result.ma60_trend = "现价低于下行MA60，中期趋势压制"
+        elif result.current_price >= result.ma60 and result.ma60_slope >= 0:
+            result.ma60_trend = "现价位于上行MA60上方，中期趋势向好"
+        elif result.current_price >= result.ma60:
+            result.ma60_trend = "现价站上MA60，但中期趋势尚未确认上行"
+        else:
+            result.ma60_trend = "现价低于MA60，中期趋势偏弱"
+
     def _calculate_bias(self, result: TrendAnalysisResult) -> None:
         """
         计算乖离率
@@ -345,6 +403,55 @@ class StockTrendAnalyzer:
             if recent_high > price:
                 result.resistance_levels.append(recent_high)
     
+    def _calculate_trade_plan(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """计算规则层买点、止损、目标位和盈亏比。"""
+        price = result.current_price
+        valid_supports = [level for level in [result.ma5, result.ma10, result.ma20] if level > 0]
+
+        if not valid_supports or price <= 0:
+            return
+
+        if result.bias_ma5 >= self.BIAS_THRESHOLD:
+            result.ideal_buy = round(result.ma5, 2)
+        else:
+            nearby_supports = [level for level in valid_supports if abs(price - level) / level <= self.MA_SUPPORT_TOLERANCE]
+            result.ideal_buy = round(min(nearby_supports, key=lambda level: abs(price - level)) if nearby_supports else result.ma5, 2)
+
+        if result.ma10 > 0 and result.ma10 != result.ideal_buy:
+            result.secondary_buy = round(result.ma10, 2)
+        elif result.ma20 > 0:
+            result.secondary_buy = round(result.ma20, 2)
+
+        recent_low = float(df['low'].iloc[-20:].min()) if len(df) >= 20 else 0.0
+        ma20_stop = result.ma20 * 0.98 if result.ma20 > 0 else 0.0
+        stop_candidates = [level for level in [ma20_stop, recent_low * 0.98] if 0 < level < result.ideal_buy]
+        if stop_candidates:
+            result.stop_loss = round(max(stop_candidates), 2)
+
+        resistance_candidates = [level for level in result.resistance_levels if level > result.ideal_buy]
+        if resistance_candidates:
+            result.take_profit = round(min(resistance_candidates), 2)
+        elif result.stop_loss > 0:
+            risk = result.ideal_buy - result.stop_loss
+            result.take_profit = round(result.ideal_buy + risk * 1.8, 2)
+
+        if result.ideal_buy > result.stop_loss > 0 and result.take_profit > result.ideal_buy:
+            risk = result.ideal_buy - result.stop_loss
+            reward = result.take_profit - result.ideal_buy
+            result.risk_reward_ratio = round(reward / risk, 2)
+
+        if result.stop_loss > 0:
+            result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或有效跌破MA20"
+        elif result.ma20 > 0:
+            result.invalidation_condition = f"有效跌破MA20({result.ma20:.2f}元)"
+
+        if result.risk_reward_ratio >= 1.8:
+            result.position_note = "盈亏比较优，可按规则仓位执行"
+        elif result.risk_reward_ratio >= 1.2:
+            result.position_note = "盈亏比一般，仅适合低仓试探"
+        elif result.risk_reward_ratio > 0:
+            result.position_note = "盈亏比不足，等待更优买点"
+
     def _generate_signal(self, result: TrendAnalysisResult) -> None:
         """
         生成买入信号
@@ -423,7 +530,27 @@ class StockTrendAnalyzer:
         if result.support_ma10:
             score += 5
             reasons.append("✅ MA10支撑有效")
-        
+
+        if result.ma60_trend:
+            if result.medium_trend_risk:
+                score = min(score, 60)
+                risks.append(f"⚠️ {result.ma60_trend}，限制追多")
+            else:
+                reasons.append(f"✅ {result.ma60_trend}")
+
+        if result.bias_ma5 >= self.BIAS_THRESHOLD:
+            score = min(score, 59)
+
+        if result.risk_reward_ratio > 0:
+            if result.risk_reward_ratio < 1.2:
+                score = min(score, 49)
+                risks.append(f"⚠️ 盈亏比不足({result.risk_reward_ratio:.2f}<1.20)，等待更优点位")
+            elif result.risk_reward_ratio < 1.8:
+                score = min(score, 69)
+                risks.append(f"⚠️ 盈亏比一般({result.risk_reward_ratio:.2f})，仅适合低仓试探")
+            else:
+                reasons.append(f"✅ 盈亏比{result.risk_reward_ratio:.2f}，具备交易空间")
+
         # === 综合判断 ===
         result.signal_score = score
         result.signal_reasons = reasons
@@ -465,10 +592,21 @@ class StockTrendAnalyzer:
             f"   MA5:  {result.ma5:.2f} (乖离 {result.bias_ma5:+.2f}%)",
             f"   MA10: {result.ma10:.2f} (乖离 {result.bias_ma10:+.2f}%)",
             f"   MA20: {result.ma20:.2f} (乖离 {result.bias_ma20:+.2f}%)",
+            f"   MA60: {result.ma60:.2f} (相对 {result.price_vs_ma60:+.2f}%, 斜率 {result.ma60_slope:+.2f}%)",
+            f"   中期趋势: {result.ma60_trend}",
             f"",
             f"📊 量能分析: {result.volume_status.value}",
             f"   量比(vs5日): {result.volume_ratio_5d:.2f}",
             f"   量能趋势: {result.volume_trend}",
+            f"",
+            f"🎯 规则交易计划:",
+            f"   理想买点: {result.ideal_buy:.2f}",
+            f"   次优买点: {result.secondary_buy:.2f}",
+            f"   止损位: {result.stop_loss:.2f}",
+            f"   目标位: {result.take_profit:.2f}",
+            f"   盈亏比: {result.risk_reward_ratio:.2f}",
+            f"   失效条件: {result.invalidation_condition or 'N/A'}",
+            f"   仓位提示: {result.position_note or 'N/A'}",
             f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",
@@ -532,4 +670,4 @@ if __name__ == "__main__":
     
     analyzer = StockTrendAnalyzer()
     result = analyzer.analyze(df, '000001')
-    print(analyzer.format_analysis(result))
+    print(analyzer.format_analysis(result).encode('utf-8', errors='ignore').decode('utf-8'))

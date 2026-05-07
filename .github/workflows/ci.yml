@@ -66,7 +66,7 @@ jobs:
           python -c "from storage import DatabaseManager; print('✅ storage')"
           python -c "from notification import NotificationService; print('✅ notification')"
           python -c "from data_provider import DataFetcherManager; print('✅ data_provider')"
-          python -c "from analyzer import GeminiAnalyzer; print('✅ analyzer')"
+          python -c "from analyzer import OpenAIAnalyzer; print('✅ analyzer')"
           echo "✅ 所有模块导入成功"
 
   # ==================== Docker 构建测试 ====================

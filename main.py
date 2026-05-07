@@ -30,8 +30,13 @@ import time
 import warnings
 import pandas as pd
 
-# 代理配置
-# 策略：不清除全局代理，而是将国内数据源域名加入 no_proxy，强制直连
+# 配置代理：默认使用 Clash HTTP 代理（可通过环境变量覆盖）
+os.environ.setdefault("http_proxy", "http://127.0.0.1:7890")
+os.environ.setdefault("https_proxy", "http://127.0.0.1:7890")
+os.environ.setdefault("HTTP_PROXY", os.environ["http_proxy"])
+os.environ.setdefault("HTTPS_PROXY", os.environ["https_proxy"])
+
+# 国内数据源域名加入 no_proxy，强制直连
 # 这样可以同时保证：
 # 1. AkShare/Tushare 直连国内服务器（解决 ProxyError）
 # 2. OpenAI/Telegram 继续走代理（解决无法访问的问题）
@@ -69,11 +74,11 @@ from config import get_config, Config
 from storage import get_db, DatabaseManager
 from data_provider import DataFetcherManager
 from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
-from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
+from analyzer import OpenAIAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
 from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
-from market_analyzer import MarketAnalyzer
+from market_analyzer import MarketAnalyzer, evaluate_market_environment
 from user_manager import UserManager
 
 # 配置日志格式
@@ -176,8 +181,9 @@ class StockAnalysisPipeline:
         self.fetcher_manager = DataFetcherManager()
         self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
-        self.analyzer = GeminiAnalyzer()
+        self.analyzer = OpenAIAnalyzer()
         self.notifier = NotificationService()
+        self._market_context: Optional[Dict[str, Any]] = None
         
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -228,7 +234,7 @@ class StockAnalysisPipeline:
             
             # 从数据源获取数据
             logger.info(f"[{code}] 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            df, source_name = self.fetcher_manager.get_daily_data(code, days=250)
             
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -244,6 +250,44 @@ class StockAnalysisPipeline:
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
     
+    def _get_market_context(self) -> Dict[str, Any]:
+        """获取单轮运行内复用的大盘/板块环境。"""
+        if self._market_context is not None:
+            return self._market_context
+
+        neutral_context = {
+            'overview': {},
+            'environment': {
+                'market_score': 50,
+                'market_status': '震荡',
+                'risk_level': '中',
+                'summary': '市场环境数据不足，按中性处理',
+                'reasons': ['市场环境数据获取失败或缺失'],
+                'avg_index_change': 0.0,
+                'top_sectors': [],
+                'bottom_sectors': [],
+                'sector_heat_summary': '领涨板块：无；领跌板块：无',
+            },
+        }
+
+        try:
+            market_analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+            overview = market_analyzer.get_market_overview()
+            environment = evaluate_market_environment(overview)
+            self._market_context = {
+                'overview': overview.to_dict(),
+                'environment': environment,
+            }
+            logger.info(
+                f"大盘环境: {environment['market_status']} "
+                f"(评分={environment['market_score']}, 风险={environment['risk_level']})"
+            )
+        except Exception as e:
+            logger.warning(f"获取大盘环境失败，使用中性环境: {e}")
+            self._market_context = neutral_context
+
+        return self._market_context
+
     def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
@@ -349,13 +393,15 @@ class StockAnalysisPipeline:
                 logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
                 return None
             
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称、大盘环境）
+            market_context = self._get_market_context()
             enhanced_context = self._enhance_context(
-                context, 
-                realtime_quote, 
-                chip_data, 
+                context,
+                realtime_quote,
+                chip_data,
                 trend_result,
-                stock_name  # 传入股票名称
+                stock_name,
+                market_context
             )
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
@@ -374,7 +420,8 @@ class StockAnalysisPipeline:
         realtime_quote: Optional[RealtimeQuote],
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
-        stock_name: str = ""
+        stock_name: str = "",
+        market_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -398,7 +445,10 @@ class StockAnalysisPipeline:
             enhanced['stock_name'] = stock_name
         elif realtime_quote and realtime_quote.name:
             enhanced['stock_name'] = realtime_quote.name
-        
+
+        if market_context:
+            enhanced['market_context'] = market_context
+
         # 添加实时行情
         if realtime_quote:
             enhanced['realtime'] = {
@@ -433,12 +483,31 @@ class StockAnalysisPipeline:
                 'trend_strength': trend_result.trend_strength,
                 'bias_ma5': trend_result.bias_ma5,
                 'bias_ma10': trend_result.bias_ma10,
+                'bias_ma20': trend_result.bias_ma20,
+                'ma60_trend': trend_result.ma60_trend,
+                'price_vs_ma60': trend_result.price_vs_ma60,
+                'ma60_slope': trend_result.ma60_slope,
+                'medium_trend_risk': trend_result.medium_trend_risk,
+                'current_price': trend_result.current_price,
+                'ma5': trend_result.ma5,
+                'ma10': trend_result.ma10,
+                'ma20': trend_result.ma20,
+                'ma60': trend_result.ma60,
+                'support_levels': trend_result.support_levels,
+                'resistance_levels': trend_result.resistance_levels,
                 'volume_status': trend_result.volume_status.value,
                 'volume_trend': trend_result.volume_trend,
                 'buy_signal': trend_result.buy_signal.value,
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'ideal_buy': trend_result.ideal_buy,
+                'secondary_buy': trend_result.secondary_buy,
+                'stop_loss': trend_result.stop_loss,
+                'take_profit': trend_result.take_profit,
+                'risk_reward_ratio': trend_result.risk_reward_ratio,
+                'invalidation_condition': trend_result.invalidation_condition,
+                'position_note': trend_result.position_note,
             }
         
         return enhanced
@@ -757,15 +826,21 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_market_review(notifier: NotificationService, analyzer=None, search_service=None) -> Optional[str]:
+def run_market_review(
+    notifier: NotificationService,
+    analyzer=None,
+    search_service=None,
+    send_notification: bool = True
+) -> Optional[str]:
     """
     执行大盘复盘分析
-    
+
     Args:
         notifier: 通知服务
         analyzer: AI分析器（可选）
         search_service: 搜索服务（可选）
-    
+        send_notification: 是否推送通知
+
     Returns:
         复盘报告文本
     """
@@ -791,16 +866,18 @@ def run_market_review(notifier: NotificationService, analyzer=None, search_servi
             logger.info(f"大盘复盘报告已保存: {filepath}")
             
             # 推送通知
-            if notifier.is_available():
+            if send_notification and notifier.is_available():
                 # 添加标题
                 report_content = f"🎯 大盘复盘\n\n{review_report}"
-                
+
                 success = notifier.send(report_content)
                 if success:
                     logger.info("大盘复盘推送成功")
                 else:
                     logger.warning("大盘复盘推送失败")
-            
+            elif not send_notification:
+                logger.info("已禁用通知，跳过大盘复盘推送")
+
             return review_report
         
     except Exception as e:
@@ -835,12 +912,13 @@ def run_full_analysis(
         
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
         market_report = ""
-        if config.market_review_enabled and not args.no_market_review:
+        if config.market_review_enabled and not args.no_market_review and not args.dry_run:
             # 只调用一次，并获取结果
             review_result = run_market_review(
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service
+                search_service=pipeline.search_service,
+                send_notification=not args.no_notify
             )
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
@@ -885,8 +963,10 @@ def run_full_analysis(
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
                 if doc_url:
                     logger.info(f"飞书云文档创建成功: {doc_url}")
-                    # 可选：将文档链接也推送到群里
-                    pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
+                    if not args.no_notify:
+                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
+                    else:
+                        logger.info("已禁用通知，跳过飞书文档链接推送")
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
@@ -943,10 +1023,15 @@ def main() -> int:
                     serpapi_keys=config.serpapi_keys
                 )
             
-            if config.gemini_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-            
-            run_market_review(notifier, analyzer, search_service)
+            if config.openai_api_key and config.openai_base_url and config.openai_model:
+                analyzer = OpenAIAnalyzer()
+
+            run_market_review(
+                notifier,
+                analyzer,
+                search_service,
+                send_notification=not args.no_notify
+            )
             return 0
         
         # 模式2: 定时任务模式

@@ -5,9 +5,9 @@ A股自选股智能分析系统 - AI分析层
 ===================================
 
 职责：
-1. 封装 Gemini API 调用逻辑
-2. 利用 Google Search Grounding 获取实时新闻
-3. 结合技术面和消息面生成分析报告
+1. 封装 OpenAI 标准/兼容 API 调用逻辑
+2. 结合预先搜索的新闻和技术面数据生成分析报告
+3. 解析模型返回的 JSON 格式结果
 """
 
 import json
@@ -40,7 +40,7 @@ class AnalysisResult:
     """
     AI 分析结果数据类 - 决策仪表盘版
     
-    封装 Gemini 返回的分析结果，包含决策仪表盘和详细分析
+    封装 LLM 返回的分析结果，包含决策仪表盘和详细分析
     """
     code: str
     name: str
@@ -173,17 +173,17 @@ class AnalysisResult:
         return star_map.get(self.confidence_level, '⭐⭐')
 
 
-class GeminiAnalyzer:
+class OpenAIAnalyzer:
     """
-    Gemini AI 分析器
-    
+    OpenAI 标准/兼容接口分析器
+
     职责：
-    1. 调用 Google Gemini API 进行股票分析
+    1. 调用 OpenAI Chat Completions 兼容接口进行股票分析
     2. 结合预先搜索的新闻和技术面数据生成分析报告
     3. 解析 AI 返回的 JSON 格式结果
-    
+
     使用方式：
-        analyzer = GeminiAnalyzer()
+        analyzer = OpenAIAnalyzer()
         result = analyzer.analyze(context, news_context)
     """
     
@@ -290,10 +290,12 @@ class GeminiAnalyzer:
         
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "规则层理想买入点：XX元（来自MA5/MA10支撑）",
+                "secondary_buy": "规则层次优买入点：XX元（来自MA10/MA20支撑）",
+                "stop_loss": "规则层止损位：XX元（来自MA20/前低）",
+                "take_profit": "规则层目标位：XX元（来自压力位/盈亏比）",
+                "risk_reward_ratio": "规则层盈亏比：X.XX",
+                "invalidation_condition": "规则层信号失效条件"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -364,7 +366,7 @@ class GeminiAnalyzer:
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
+3. **精确狙击点**：必须使用规则层提供的买点、止损、目标位和盈亏比，不自行创造点位
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出"""
 
@@ -372,10 +374,10 @@ class GeminiAnalyzer:
         """
         初始化 AI 分析器
         
-        使用 OpenAI 兼容 API（优先匹配 src_data/llm_example.py 配置）
+        使用 OpenAI 标准/兼容 API，配置来自 OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL
         """
         config = get_config()
-        self._api_key = api_key or config.openai_api_key  # 优先使用 OpenAI Key
+        self._api_key = api_key or config.openai_api_key
         self._base_url = config.openai_base_url
         self._model_name = config.openai_model
         
@@ -385,23 +387,36 @@ class GeminiAnalyzer:
         self._init_client()
         
     def _init_client(self) -> None:
-        """初始化 OpenAI 客户端"""
+        """初始化 OpenAI 标准客户端"""
+        missing = []
+        if not self._api_key:
+            missing.append('OPENAI_API_KEY')
+        if not self._base_url:
+            missing.append('OPENAI_BASE_URL')
+        if not self._model_name:
+            missing.append('OPENAI_MODEL')
+        if missing:
+            logger.warning(f"LLM 配置缺失: {', '.join(missing)}，AI 分析功能不可用")
+            self._client = None
+            self._is_available = False
+            return
+
         try:
             from openai import OpenAI
             import httpx
-            
-            logger.info(f"正在初始化 OpenAI 客户端 (base_url: {self._base_url}, model: {self._model_name})...")
-            
+
+            logger.info(f"正在初始化 OpenAI 兼容客户端 (base_url: {self._base_url}, model: {self._model_name})...")
+
             self._client = OpenAI(
                 api_key=self._api_key,
                 base_url=self._base_url,
-                http_client=httpx.Client(timeout=120)  # 增加超时设置
+                http_client=httpx.Client(timeout=120)
             )
             self._is_available = True
-            logger.info(f"OpenAI 客户端初始化成功")
-            
+            logger.info("OpenAI 兼容客户端初始化成功")
+
         except Exception as e:
-            logger.error(f"OpenAI 客户端初始化失败: {e}")
+            logger.error(f"OpenAI 兼容客户端初始化失败: {e}")
             self._client = None
             self._is_available = False
     
@@ -416,8 +431,8 @@ class GeminiAnalyzer:
         调用 AI API (仅支持 OpenAI 兼容接口)
         """
         config = get_config()
-        max_retries = config.gemini_max_retries
-        base_delay = config.gemini_retry_delay
+        max_retries = config.llm_max_retries
+        base_delay = config.llm_retry_delay
         
         if not self._client:
             raise RuntimeError("OpenAI 客户端未初始化")
@@ -427,7 +442,7 @@ class GeminiAnalyzer:
                 if attempt > 0:
                     delay = base_delay * (2 ** (attempt - 1))
                     delay = min(delay, 60)
-                    logger.info(f"及第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    logger.info(f"第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
                 response = self._client.chat.completions.create(
@@ -465,7 +480,7 @@ class GeminiAnalyzer:
         
         流程：
         1. 格式化输入数据（技术面 + 新闻）
-        2. 调用 Gemini API（带重试和模型切换）
+        2. 调用 OpenAI 兼容 API（带重试）
         3. 解析 JSON 响应
         4. 返回结构化结果
         
@@ -480,7 +495,7 @@ class GeminiAnalyzer:
         config = get_config()
         
         # 请求前增加延时（防止连续请求触发限流）
-        request_delay = config.gemini_request_delay
+        request_delay = config.llm_request_delay
         if request_delay > 0:
             logger.debug(f"[LLM] 请求前等待 {request_delay:.1f} 秒...")
             time.sleep(request_delay)
@@ -505,9 +520,9 @@ class GeminiAnalyzer:
                 operation_advice='持有',
                 confidence_level='低',
                 analysis_summary='AI 分析功能未启用（未配置 API Key）',
-                risk_warning='请配置 Gemini API Key 后重试',
+                risk_warning='请配置 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL 后重试',
                 success=False,
-                error_message='Gemini API Key 未配置',
+                error_message='OpenAI 兼容 API 配置未完成',
             )
         
         try:
@@ -534,7 +549,7 @@ class GeminiAnalyzer:
                 "max_output_tokens": 8192,
             }
             
-            logger.info(f"[LLM调用] 开始调用 Gemini API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
+            logger.info(f"[LLM调用] 开始调用 OpenAI 兼容 API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
             
             # 使用带重试的 API 调用
             start_time = time.time()
@@ -542,15 +557,16 @@ class GeminiAnalyzer:
             elapsed = time.time() - start_time
             
             # 记录响应信息
-            logger.info(f"[LLM返回] Gemini API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
+            logger.info(f"[LLM返回] OpenAI 兼容 API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
             
             # 记录响应预览（INFO级别）和完整响应（DEBUG级别）
             response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
             logger.info(f"[LLM返回 预览]\n{response_preview}")
-            logger.debug(f"=== Gemini 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
+            logger.debug(f"=== LLM 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
             
             # 解析响应
             result = self._parse_response(response_text, code, name)
+            result = self._apply_hard_rules(result, context)
             result.raw_response = response_text
             result.search_performed = bool(news_context)
             
@@ -631,7 +647,43 @@ class GeminiAnalyzer:
 | MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
 | 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
 """
-        
+
+        if 'market_context' in context:
+            market_context = context['market_context'] or {}
+            environment = market_context.get('environment') or {}
+            overview = market_context.get('overview') or {}
+            indices = overview.get('indices') or []
+            index_text = ', '.join(
+                f"{idx.get('name', '')}({idx.get('change_pct', 0):+.2f}%)"
+                for idx in indices[:4]
+            ) if indices else '无'
+            top_sectors = environment.get('top_sectors') or overview.get('top_sectors') or []
+            bottom_sectors = environment.get('bottom_sectors') or overview.get('bottom_sectors') or []
+            top_sector_text = ', '.join(f"{s.get('name')}({s.get('change_pct', 0):+.2f}%)" for s in top_sectors[:3]) if top_sectors else '无'
+            bottom_sector_text = ', '.join(f"{s.get('name')}({s.get('change_pct', 0):+.2f}%)" for s in bottom_sectors[:3]) if bottom_sectors else '无'
+            reason_text = chr(10).join('- ' + reason for reason in environment.get('reasons', [])) or '- 无'
+            prompt += f"""
+### 市场/板块环境（仓位与信号过滤）
+| 指标 | 数值 | 纪律约束 |
+|------|------|----------|
+| 市场状态 | {environment.get('market_status', '未知')} | 弱市降低仓位，极弱优先观望 |
+| 环境评分 | {environment.get('market_score', 50)}/100 | 仅作为风控过滤，不替代个股趋势 |
+| 风险等级 | {environment.get('risk_level', '中')} | 高风险不输出高置信度买入 |
+| 环境摘要 | {environment.get('summary', '未知')} | |
+| 指数表现 | {index_text} | |
+| 板块热度 | {environment.get('sector_heat_summary', '无')} | |
+| 领涨板块 | {top_sector_text} | 相关题材可加关注 |
+| 领跌板块 | {bottom_sector_text} | 相关题材需警惕拖累 |
+
+**环境判断依据**：
+{reason_text}
+
+**市场/板块纪律**：
+- 大盘偏弱/极弱时，不得给高置信度买入；仓位建议必须保守。
+- 大盘极弱且个股不是强势多头时，优先输出观望。
+- 无法确认个股所属板块时，不要臆造板块归属，只基于已知新闻、股票名称和行业信息谨慎判断。
+"""
+
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context:
             rt = context['realtime']
@@ -668,18 +720,42 @@ class GeminiAnalyzer:
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
             bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
+            support_levels = trend.get('support_levels') or []
+            resistance_levels = trend.get('resistance_levels') or []
+            support_text = ', '.join(f"{level:.2f}" for level in support_levels[:3]) if support_levels else '无'
+            resistance_text = ', '.join(f"{level:.2f}" for level in resistance_levels[:3]) if resistance_levels else '无'
             prompt += f"""
 ### 趋势分析预判（基于交易理念）
 | 指标 | 数值 | 判定 |
 |------|------|------|
 | 趋势状态 | {trend.get('trend_status', '未知')} | |
 | 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
+| 当前价 | {trend.get('current_price', 'N/A')} | |
+| MA5/MA10/MA20/MA60 | {trend.get('ma5', 'N/A')} / {trend.get('ma10', 'N/A')} / {trend.get('ma20', 'N/A')} / {trend.get('ma60', 'N/A')} | |
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
+| 规则支撑位 | {support_text} | 优先参考 MA5/MA10/MA20 附近支撑 |
+| 规则压力位 | {resistance_text} | 目标位优先参考近期压力 |
 | 系统信号 | {trend.get('buy_signal', '未知')} | |
 | 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 规则理想买点 | {trend.get('ideal_buy', 'N/A')} | 由规则层计算，LLM不得自行改写 |
+| 规则次优买点 | {trend.get('secondary_buy', 'N/A')} | 由规则层计算，LLM不得自行改写 |
+| 规则止损位 | {trend.get('stop_loss', 'N/A')} | 由规则层计算，LLM不得自行改写 |
+| 规则目标位 | {trend.get('take_profit', 'N/A')} | 由规则层计算，LLM不得自行改写 |
+| 规则盈亏比 | {trend.get('risk_reward_ratio', 0):.2f} | <1.2不买，1.2-1.8低仓试探，>=1.8正常仓位 |
+| 失效条件 | {trend.get('invalidation_condition', 'N/A')} | |
+| 仓位提示 | {trend.get('position_note', 'N/A')} | |
+| 中期趋势 | {trend.get('ma60_trend', '未知')} | MA60斜率 {trend.get('ma60_slope', 0):+.2f}% |
+
+### 硬规则约束（最终 JSON 必须服从）
+- 若乖离率(MA5) > 5%，operation_advice 不得输出“买入/加仓/强烈买入”，必须以“观望”为主。
+- 若趋势状态为空头排列/强势空头，operation_advice 不得输出买入类建议。
+- 若筹码获利比例过高且筹码分散，必须在 risk_warning 和 risk_alerts 中明确提示获利盘兑现风险。
+- 买点、止损、目标位、盈亏比必须使用规则层给出的数值，LLM 只解释来源，不得自行创造点位。
+- 若规则盈亏比 < 1.2，operation_advice 不得输出买入类建议；1.2-1.8 之间只能低仓试探。
+- 若市场环境为偏弱/极弱，不得输出高置信度买入；极弱环境且个股非强势多头时，优先观望并降低仓位。
 
 #### 系统分析理由
 **买入理由**：
@@ -738,7 +814,7 @@ class GeminiAnalyzer:
 ### 决策仪表盘要求：
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
-- **具体狙击点位**：买入价、止损价、目标价（精确到分）
+- **具体狙击点位**：使用规则层提供的买入价、止损价、目标价和盈亏比（精确到分），只解释不改写
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
 
 请输出完整的 JSON 格式决策仪表盘。"""
@@ -774,7 +850,7 @@ class GeminiAnalyzer:
         name: str
     ) -> AnalysisResult:
         """
-        解析 Gemini 响应（决策仪表盘版）
+        解析 LLM 响应（决策仪表盘版）
         
         尝试从响应中提取 JSON 格式的分析结果，包含 dashboard 字段
         如果解析失败，尝试智能提取或返回默认结果
@@ -849,6 +925,133 @@ class GeminiAnalyzer:
             logger.warning(f"JSON 解析失败: {e}，尝试从文本提取")
             return self._parse_text_response(response_text, code, name)
     
+    def _apply_hard_rules(self, result: AnalysisResult, context: Dict[str, Any]) -> AnalysisResult:
+        """Apply non-negotiable trading discipline after LLM parsing."""
+        trend = context.get('trend_analysis') or {}
+        chip = context.get('chip') or {}
+        market_context = context.get('market_context') or {}
+        market_environment = market_context.get('environment') or {}
+        warnings = []
+        buy_advices = {'买入', '加仓', '强烈买入'}
+
+        bias_ma5 = float(trend.get('bias_ma5') or 0)
+        trend_status = str(trend.get('trend_status') or '')
+        market_status = str(market_environment.get('market_status') or '')
+        risk_reward_ratio = float(trend.get('risk_reward_ratio') or 0)
+
+        if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
+            result.operation_advice = '观望'
+            result.trend_prediction = '震荡'
+            result.sentiment_score = min(result.sentiment_score, 59)
+            result.confidence_level = '中'
+            warnings.append(f"规则盈亏比为{risk_reward_ratio:.2f}，低于1.20，不满足买入纪律")
+        elif 1.2 <= risk_reward_ratio < 1.8:
+            if result.confidence_level == '高':
+                result.confidence_level = '中'
+            if result.operation_advice in buy_advices:
+                result.sentiment_score = min(result.sentiment_score, 69)
+            warnings.append(f"规则盈亏比为{risk_reward_ratio:.2f}，仅适合低仓试探")
+        if bias_ma5 > 5 and result.operation_advice in buy_advices:
+            result.operation_advice = '观望'
+            result.trend_prediction = '震荡'
+            result.sentiment_score = min(result.sentiment_score, 59)
+            result.confidence_level = '中'
+            warnings.append(f"乖离率MA5为{bias_ma5:.2f}%，超过5%纪律线，禁止追高")
+
+        if any(status in trend_status for status in ['空头排列', '强势空头']) and result.operation_advice in buy_advices:
+            result.operation_advice = '观望'
+            result.trend_prediction = '看空'
+            result.sentiment_score = min(result.sentiment_score, 39)
+            result.confidence_level = '中'
+            warnings.append(f"趋势状态为{trend_status}，不允许买入类建议")
+
+        if market_status == '极弱':
+            if result.operation_advice in buy_advices:
+                result.operation_advice = '观望'
+                result.trend_prediction = '震荡'
+            result.sentiment_score = min(result.sentiment_score, 55)
+            result.confidence_level = '低' if result.confidence_level == '高' else result.confidence_level
+            warnings.append("大盘环境极弱，优先控制仓位并等待市场企稳")
+        elif market_status == '偏弱':
+            if result.confidence_level == '高':
+                result.confidence_level = '中'
+            if result.operation_advice in buy_advices:
+                result.sentiment_score = min(result.sentiment_score, 65)
+            warnings.append("大盘环境偏弱，买入类操作需降低仓位并等待确认")
+
+        profit_ratio = float(chip.get('profit_ratio') or 0)
+        concentration_90 = float(chip.get('concentration_90') or 0)
+        if profit_ratio >= 0.9 and concentration_90 >= 0.15:
+            warnings.append(f"获利比例{profit_ratio:.1%}且90%筹码集中度{concentration_90:.2%}，需警惕获利盘兑现")
+            result.sentiment_score = min(result.sentiment_score, 69)
+            if result.confidence_level == '高':
+                result.confidence_level = '中'
+
+        support_levels = trend.get('support_levels') or []
+        resistance_levels = trend.get('resistance_levels') or []
+        primary_support = min(support_levels, key=lambda x: abs(x - float(trend.get('current_price') or x))) if support_levels else None
+        primary_resistance = min(resistance_levels) if resistance_levels else None
+
+        if result.dashboard:
+            data_perspective = result.dashboard.setdefault('data_perspective', {})
+            price_position = data_perspective.setdefault('price_position', {})
+            if primary_support is not None:
+                price_position['support_level'] = round(float(primary_support), 2)
+            if primary_resistance is not None:
+                price_position['resistance_level'] = round(float(primary_resistance), 2)
+
+            battle_plan = result.dashboard.setdefault('battle_plan', {})
+            sniper_points = battle_plan.setdefault('sniper_points', {})
+            if trend.get('ideal_buy'):
+                sniper_points['ideal_buy'] = f"规则层理想买入点：{float(trend['ideal_buy']):.2f}元"
+            if trend.get('secondary_buy'):
+                sniper_points['secondary_buy'] = f"规则层次优买入点：{float(trend['secondary_buy']):.2f}元"
+            if trend.get('stop_loss'):
+                sniper_points['stop_loss'] = f"规则层止损位：{float(trend['stop_loss']):.2f}元"
+            if trend.get('take_profit'):
+                sniper_points['take_profit'] = f"规则层目标位：{float(trend['take_profit']):.2f}元"
+            if risk_reward_ratio:
+                sniper_points['risk_reward_ratio'] = f"规则层盈亏比：{risk_reward_ratio:.2f}"
+            if trend.get('invalidation_condition'):
+                sniper_points['invalidation_condition'] = trend['invalidation_condition']
+
+        if warnings:
+            result.risk_warning = self._append_warnings(result.risk_warning, warnings)
+            if result.dashboard:
+                intelligence = result.dashboard.setdefault('intelligence', {})
+                risk_alerts = intelligence.setdefault('risk_alerts', [])
+                for warning in warnings:
+                    if warning not in risk_alerts:
+                        risk_alerts.append(warning)
+                core = result.dashboard.get('core_conclusion', {})
+                if core and result.operation_advice == '观望':
+                    if market_status == '极弱':
+                        core['one_sentence'] = '大盘环境极弱，暂以观望为主'
+                    else:
+                        core['one_sentence'] = '硬规则触发，暂以观望为主'
+                    core['signal_type'] = '🟡持有观望'
+                    position_advice = core.setdefault('position_advice', {})
+                    if market_status == '极弱':
+                        position_advice['no_position'] = '空仓等待市场企稳后再寻找回踩买点'
+                    else:
+                        position_advice['no_position'] = '空仓等待回踩到规则支撑位附近，不追高买入'
+                battle_plan = result.dashboard.setdefault('battle_plan', {})
+                position_strategy = battle_plan.setdefault('position_strategy', {})
+                if result.operation_advice == '观望':
+                    position_strategy['suggested_position'] = '空仓或极低仓位观察' if market_status == '极弱' else '空仓或低仓位观察'
+                elif risk_reward_ratio and risk_reward_ratio < 1.8 and result.operation_advice in buy_advices:
+                    position_strategy['suggested_position'] = '低仓位试探，等待盈亏比改善或支撑确认'
+                elif market_status == '偏弱' and result.operation_advice in buy_advices:
+                    position_strategy['suggested_position'] = '低仓位试探，等待市场确认'
+
+        return result
+
+    @staticmethod
+    def _append_warnings(existing: str, warnings: List[str]) -> str:
+        parts = [existing] if existing else []
+        parts.extend(warnings)
+        return '；'.join(part for part in parts if part)
+
     def _fix_json_string(self, json_str: str) -> str:
         """修复常见的 JSON 格式问题"""
         import re
@@ -944,9 +1147,12 @@ class GeminiAnalyzer:
 
 
 # 便捷函数
-def get_analyzer() -> GeminiAnalyzer:
-    """获取 Gemini 分析器实例"""
-    return GeminiAnalyzer()
+def get_analyzer() -> OpenAIAnalyzer:
+    """获取 OpenAI 兼容分析器实例"""
+    return OpenAIAnalyzer()
+
+
+GeminiAnalyzer = OpenAIAnalyzer
 
 
 if __name__ == "__main__":
@@ -975,11 +1181,11 @@ if __name__ == "__main__":
         'price_change_ratio': 1.5,
     }
     
-    analyzer = GeminiAnalyzer()
+    analyzer = OpenAIAnalyzer()
     
     if analyzer.is_available():
         print("=== AI 分析测试 ===")
         result = analyzer.analyze(test_context)
         print(f"分析结果: {result.to_dict()}")
     else:
-        print("Gemini API 未配置，跳过测试")
+        print("OpenAI 兼容 API 配置未完成，跳过测试")

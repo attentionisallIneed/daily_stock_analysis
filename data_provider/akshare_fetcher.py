@@ -277,6 +277,21 @@ class AkshareFetcher(BaseFetcher):
         finally:
             pass
     
+    def _fetch_with_retry(self, api_name: str, fetch_func):
+        """对不稳定的 AkShare 接口做轻量重试。"""
+        from tenacity import Retrying
+
+        for attempt in Retrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            retry=retry_if_exception_type(Exception),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                logger.debug(f"[API重试] {api_name} 第 {attempt.retry_state.attempt_number} 次尝试")
+                return fetch_func()
+
     def _enforce_rate_limit(self) -> None:
         """
         强制执行速率限制
@@ -301,7 +316,7 @@ class AkshareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, DataFetchError, RateLimitError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -350,12 +365,15 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             with self._without_proxy():
-                df = ak.stock_zh_a_hist(
-                    symbol=stock_code,
-                    period="daily",
-                    start_date=start_date.replace('-', ''),
-                    end_date=end_date.replace('-', ''),
-                    adjust="qfq"  # 前复权
+                df = self._fetch_with_retry(
+                    "ak.stock_zh_a_hist",
+                    lambda: ak.stock_zh_a_hist(
+                        symbol=stock_code,
+                        period="daily",
+                        start_date=start_date.replace('-', ''),
+                        end_date=end_date.replace('-', ''),
+                        adjust="qfq"
+                    )
                 )
             
             api_elapsed = _time.time() - api_start
@@ -412,12 +430,15 @@ class AkshareFetcher(BaseFetcher):
             
             # 调用 akshare 获取 ETF 日线数据
             with self._without_proxy():
-                df = ak.fund_etf_hist_em(
-                    symbol=stock_code,
-                    period="daily",
-                    start_date=start_date.replace('-', ''),
-                    end_date=end_date.replace('-', ''),
-                    adjust="qfq"  # 前复权
+                df = self._fetch_with_retry(
+                    "ak.fund_etf_hist_em",
+                    lambda: ak.fund_etf_hist_em(
+                        symbol=stock_code,
+                        period="daily",
+                        start_date=start_date.replace('-', ''),
+                        end_date=end_date.replace('-', ''),
+                        adjust="qfq"
+                    )
                 )
             
             api_elapsed = _time.time() - api_start
@@ -526,7 +547,7 @@ class AkshareFetcher(BaseFetcher):
                 api_start = _time.time()
                 
                 with self._without_proxy():
-                    df = ak.stock_zh_a_spot_em()
+                    df = self._fetch_with_retry("ak.stock_zh_a_spot_em", ak.stock_zh_a_spot_em)
                 
                 api_elapsed = _time.time() - api_start
                 logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
@@ -611,7 +632,7 @@ class AkshareFetcher(BaseFetcher):
                 api_start = _time.time()
                 
                 with self._without_proxy():
-                    df = ak.fund_etf_spot_em()
+                    df = self._fetch_with_retry("ak.fund_etf_spot_em", ak.fund_etf_spot_em)
                 
                 api_elapsed = _time.time() - api_start
                 logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
@@ -696,7 +717,7 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             with self._without_proxy():
-                df = ak.stock_cyq_em(symbol=stock_code)
+                df = self._fetch_with_retry("ak.stock_cyq_em", lambda: ak.stock_cyq_em(symbol=stock_code))
             
             api_elapsed = _time.time() - api_start
             
@@ -782,7 +803,7 @@ class AkshareFetcher(BaseFetcher):
         try:
             with self._without_proxy():
                 # 尝试使用专用接口获取名称
-                name_df = ak.stock_info_a_code_name()
+                name_df = self._fetch_with_retry("ak.stock_info_a_code_name", ak.stock_info_a_code_name)
                 if name_df is not None and not name_df.empty:
                     # 过滤出对应代码
                     # 注意：该接口返回的 DataFrame 列名为 'code', 'name' 或 '股票代码', '股票名称'
