@@ -74,6 +74,7 @@ from config import get_config, Config
 from storage import get_db, DatabaseManager
 from data_provider import DataFetcherManager
 from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
+from company_intel import CompanyIntelligence, CompanyIntelligenceService
 from analyzer import OpenAIAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
@@ -184,6 +185,7 @@ class StockAnalysisPipeline:
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = OpenAIAnalyzer()
         self.notifier = NotificationService()
+        self.company_intel_service = CompanyIntelligenceService(self.akshare_fetcher)
         self._market_context: Optional[Dict[str, Any]] = None
         self._benchmark_history = None
         self._benchmark_history_loaded = False
@@ -312,10 +314,11 @@ class StockAnalysisPipeline:
         流程：
         1. 获取实时行情（量比、换手率）
         2. 获取筹码分布
-        3. 进行趋势分析（基于交易理念）
-        4. 多维度情报搜索（最新消息+风险排查+业绩预期）
-        5. 从数据库获取分析上下文
-        6. 调用 AI 进行综合分析
+        3. 获取官方公告和结构化财务指标
+        4. 进行趋势分析（基于交易理念）
+        5. 多维度情报搜索（最新消息+风险排查+业绩预期）
+        6. 从数据库获取分析上下文
+        7. 调用 AI 进行综合分析
         
         Args:
             code: 股票代码
@@ -363,8 +366,19 @@ class StockAnalysisPipeline:
                               f"90%集中度={chip_data.concentration_90:.2%}")
             except Exception as e:
                 logger.warning(f"[{code}] 获取筹码分布失败: {e}")
+
+            # Step 3: 官方公告与结构化财务指标
+            company_intel: Optional[CompanyIntelligence] = None
+            try:
+                company_intel = self.company_intel_service.get_company_intelligence(code, stock_name)
+                logger.info(
+                    f"[{code}] 官方情报: 公告{len(company_intel.announcements)}条, "
+                    f"风险{len(company_intel.risk_flags)}条"
+                )
+            except Exception as e:
+                logger.warning(f"[{code}] 获取官方公告/财务数据失败: {e}")
             
-            # Step 3: 趋势分析（基于交易理念）
+            # Step 4: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None
             try:
                 # 获取历史数据进行趋势分析
@@ -386,7 +400,7 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.warning(f"[{code}] 趋势分析失败: {e}")
             
-            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
+            # Step 5: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
             if self.search_service.is_available:
                 logger.info(f"[{code}] 开始多维度情报搜索...")
@@ -409,14 +423,14 @@ class StockAnalysisPipeline:
             else:
                 logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
             
-            # Step 5: 获取分析上下文（技术面数据）
+            # Step 6: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
             
             if context is None:
                 logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
                 return None
             
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称、大盘环境）
+            # Step 7: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称、大盘环境）
             market_context = self._get_market_context()
             if trend_result:
                 market_environment = market_context.get('environment') or {}
@@ -428,12 +442,13 @@ class StockAnalysisPipeline:
                 context,
                 realtime_quote,
                 chip_data,
+                company_intel,
                 trend_result,
                 stock_name,
                 market_context
             )
             
-            # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
+            # Step 8: 调用 AI 分析（传入增强的上下文和新闻）
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
             
             return result
@@ -448,6 +463,7 @@ class StockAnalysisPipeline:
         context: Dict[str, Any],
         realtime_quote: Optional[RealtimeQuote],
         chip_data: Optional[ChipDistribution],
+        company_intel: Optional[CompanyIntelligence],
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
         market_context: Optional[Dict[str, Any]] = None
@@ -461,6 +477,7 @@ class StockAnalysisPipeline:
             context: 原始上下文
             realtime_quote: 实时行情数据
             chip_data: 筹码分布数据
+            company_intel: 官方公告和结构化财务数据
             trend_result: 趋势分析结果
             stock_name: 股票名称
             
@@ -503,6 +520,10 @@ class StockAnalysisPipeline:
                 'concentration_70': chip_data.concentration_70,
                 'chip_status': chip_data.get_chip_status(current_price),
             }
+
+        if company_intel:
+            enhanced['company_intel'] = company_intel.to_dict()
+            enhanced['company_intel_context'] = company_intel.format_context()
         
         # 添加趋势分析结果
         if trend_result:

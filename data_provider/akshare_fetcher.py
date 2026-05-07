@@ -681,6 +681,98 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[指数行情] 获取 {index_code} 失败: {e}")
             raise DataFetchError(f"Akshare 获取指数数据失败: {e}") from e
+
+    def get_cninfo_announcements(
+        self,
+        stock_code: str,
+        days: int = 180,
+        max_items: int = 20,
+        keyword: str = "",
+    ) -> List[Dict[str, Any]]:
+        """获取巨潮资讯信息披露公告。"""
+        if _is_etf_code(stock_code):
+            logger.debug(f"[公告跳过] {stock_code} 是 ETF/基金，跳过个股公告查询")
+            return []
+
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+        start_date = start_dt.strftime("%Y%m%d")
+        end_date = end_dt.strftime("%Y%m%d")
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(
+                f"[API调用] ak.stock_zh_a_disclosure_report_cninfo(symbol={stock_code}, "
+                f"start_date={start_date}, end_date={end_date})"
+            )
+            with self._without_proxy():
+                df = self._fetch_with_retry(
+                    "ak.stock_zh_a_disclosure_report_cninfo",
+                    lambda: ak.stock_zh_a_disclosure_report_cninfo(
+                        symbol=stock_code,
+                        market="沪深京",
+                        keyword=keyword,
+                        category="",
+                        start_date=start_date,
+                        end_date=end_date,
+                    ),
+                )
+            return self._dataframe_to_records(df, max_items=max_items)
+        except Exception as e:
+            logger.warning(f"[公告] 获取 {stock_code} 巨潮公告失败: {e}")
+            return []
+
+    def get_financial_indicators(self, stock_code: str, max_items: int = 8) -> List[Dict[str, Any]]:
+        """获取东方财富主要财务指标，返回按报告期倒序的记录。"""
+        if _is_etf_code(stock_code):
+            logger.debug(f"[财务跳过] {stock_code} 是 ETF/基金，跳过个股财务指标")
+            return []
+
+        symbol = self._to_em_stock_symbol(stock_code)
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(f"[API调用] ak.stock_financial_analysis_indicator_em(symbol={symbol})")
+            with self._without_proxy():
+                df = self._fetch_with_retry(
+                    "ak.stock_financial_analysis_indicator_em",
+                    lambda: ak.stock_financial_analysis_indicator_em(symbol=symbol, indicator="按报告期"),
+                )
+
+            if df is not None and not df.empty:
+                date_col = next((col for col in ["报告期", "日期", "公告日期"] if col in df.columns), None)
+                if date_col:
+                    df = df.sort_values(date_col, ascending=False)
+            return self._dataframe_to_records(df, max_items=max_items)
+        except Exception as e:
+            logger.warning(f"[财务] 获取 {stock_code} 财务指标失败: {e}")
+            return []
+
+    @staticmethod
+    def _to_em_stock_symbol(stock_code: str) -> str:
+        """转换为东方财富财务接口需要的 301389.SZ / 600519.SH 格式。"""
+        code = str(stock_code).strip().upper()
+        if "." in code:
+            return code
+        if code.startswith(("600", "601", "603", "605", "688", "689")):
+            return f"{code}.SH"
+        return f"{code}.SZ"
+
+    @staticmethod
+    def _dataframe_to_records(df: Optional[pd.DataFrame], max_items: int = 20) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+        records = []
+        for _, row in df.head(max_items).iterrows():
+            item = {}
+            for key, value in row.to_dict().items():
+                if pd.isna(value):
+                    item[key] = ""
+                else:
+                    item[key] = value
+            records.append(item)
+        return records
     
     def get_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """

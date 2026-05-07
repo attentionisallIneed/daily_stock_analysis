@@ -785,6 +785,7 @@ class OpenAIAnalyzer:
 - 若收盘跌破 MA20，operation_advice 不得输出买入/加仓/强烈买入。
 - 仓位必须使用规则建议仓位；不得自行放大，规则建议仓位为0%时不得输出买入/加仓/强烈买入。
 - 若市场环境为偏弱/极弱，不得输出高置信度买入；极弱环境且个股非强势多头时，优先观望并降低仓位。
+- 若官方公告出现减持、处罚、立案、预亏、解禁、退市等风险，必须优先写入 risk_warning 和 risk_alerts，并降低买入置信度。
 
 #### 系统分析理由
 **买入理由**：
@@ -801,6 +802,18 @@ class OpenAIAnalyzer:
 ### 量价变化
 - 成交量较昨日变化：{volume_change}倍
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
+"""
+
+        if context.get('company_intel_context'):
+            prompt += f"""
+---
+
+## 🧾 官方公告与财务数据
+以下信息来自官方公告或结构化财务接口，优先级高于搜索摘要；如与搜索结果冲突，以官方公告和结构化数据为准。
+
+```
+{context.get('company_intel_context')}
+```
 """
         
         # 添加新闻搜索结果（重点区域）
@@ -959,6 +972,7 @@ class OpenAIAnalyzer:
         """Apply non-negotiable trading discipline after LLM parsing."""
         trend = context.get('trend_analysis') or {}
         chip = context.get('chip') or {}
+        company_intel = context.get('company_intel') or {}
         market_context = context.get('market_context') or {}
         market_environment = market_context.get('environment') or {}
         warnings = []
@@ -976,6 +990,7 @@ class OpenAIAnalyzer:
         ma20_breakdown = bool(trend.get('ma20_breakdown'))
         relative_strength_score = int(float(trend.get('relative_strength_score') or 0))
         relative_strength_status = str(trend.get('relative_strength_status') or '')
+        official_risk_flags = list(company_intel.get('risk_flags') or [])
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -1015,6 +1030,20 @@ class OpenAIAnalyzer:
             if result.confidence_level == '高':
                 result.confidence_level = '中'
             warnings.append(f"相对强弱{relative_strength_status}，不支持高置信度买入")
+
+        if official_risk_flags:
+            risk_summary = "；".join(str(flag) for flag in official_risk_flags[:3])
+            warnings.append(f"官方公告/财务风险：{risk_summary}")
+            if result.operation_advice in buy_advices:
+                severe_keywords = ['处罚', '立案', '预亏', '退市', '亏损']
+                if any(keyword in risk_summary for keyword in severe_keywords):
+                    result.sentiment_score = min(result.sentiment_score, 59)
+                    result.operation_advice = '观望'
+                    result.trend_prediction = '震荡'
+                else:
+                    result.sentiment_score = min(result.sentiment_score, 69)
+                if result.confidence_level == '高':
+                    result.confidence_level = '中'
 
         if final_position_pct <= 0 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -1056,6 +1085,14 @@ class OpenAIAnalyzer:
         primary_resistance = min(resistance_levels) if resistance_levels else None
 
         if result.dashboard:
+            if official_risk_flags:
+                intelligence = result.dashboard.setdefault('intelligence', {})
+                risk_alerts = intelligence.setdefault('risk_alerts', [])
+                for flag in official_risk_flags[:5]:
+                    text = f"官方公告/财务风险：{flag}"
+                    if text not in risk_alerts:
+                        risk_alerts.append(text)
+
             data_perspective = result.dashboard.setdefault('data_perspective', {})
             price_position = data_perspective.setdefault('price_position', {})
             if primary_support is not None:
