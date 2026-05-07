@@ -78,6 +78,7 @@ from analyzer import OpenAIAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
 from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
+from stock_screener import ScreeningResult, StockScreener
 from market_analyzer import MarketAnalyzer, evaluate_market_environment
 from user_manager import UserManager
 
@@ -816,6 +817,53 @@ class StockAnalysisPipeline:
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
 
+    def run_hot_sector_screening(
+        self,
+        top_n: int = 3,
+        sector_count: int = 5,
+        run_llm: bool = False,
+        send_notification: bool = True,
+    ) -> ScreeningResult:
+        """运行热门板块驱动选股，并可选对 Top N 复用精细分析链路。"""
+        logger.info(
+            f"===== 开始热门板块选股：板块数={sector_count}, Top N={top_n}, "
+            f"精细分析={'启用' if run_llm else '关闭'} ====="
+        )
+        screener = StockScreener(
+            daily_fetcher=self.fetcher_manager,
+            sector_fetcher=self.akshare_fetcher,
+            trend_analyzer=self.trend_analyzer,
+        )
+        screening_result = screener.screen_hot_sectors(
+            sector_count=sector_count,
+            top_n=top_n,
+        )
+
+        if run_llm and screening_result.selected:
+            logger.info(f"对 Top {len(screening_result.selected)} 候选股执行精细分析")
+            for candidate in screening_result.selected:
+                detail = self.process_single_stock(candidate.code, skip_analysis=False)
+                if detail:
+                    screening_result.detailed_results.append(detail)
+
+        report = screening_result.format_report()
+        date_str = datetime.now().strftime('%Y%m%d')
+        filepath = self.notifier.save_report_to_file(report, f"hot_sector_screening_{date_str}.md")
+        logger.info(f"热门板块选股报告已保存: {filepath}")
+
+        if send_notification and self.notifier.is_available():
+            success = self.notifier.send(report)
+            if success:
+                logger.info("热门板块选股报告推送成功")
+            else:
+                logger.warning("热门板块选股报告推送失败")
+
+        logger.info(
+            f"热门板块选股完成：有效候选 {len(screening_result.candidates)}，"
+            f"过滤 {len(screening_result.filtered)}，入选 {len(screening_result.selected)}"
+        )
+        return screening_result
+
 
 def parse_arguments() -> argparse.Namespace:
     """解析命令行参数"""
@@ -831,6 +879,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --no-notify        # 不发送推送通知
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --screen-hot-sectors --screen-no-llm  # 热门板块规则选股
         '''
     )
     
@@ -881,6 +930,32 @@ def parse_arguments() -> argparse.Namespace:
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
+    )
+
+    parser.add_argument(
+        '--screen-hot-sectors',
+        action='store_true',
+        help='启用热门板块驱动选股模式'
+    )
+
+    parser.add_argument(
+        '--screen-top-n',
+        type=int,
+        default=3,
+        help='热门板块选股后进入精细分析的 Top N，默认3'
+    )
+
+    parser.add_argument(
+        '--screen-sector-count',
+        type=int,
+        default=5,
+        help='用于粗筛的热门板块数量，默认5'
+    )
+
+    parser.add_argument(
+        '--screen-no-llm',
+        action='store_true',
+        help='只输出规则层排序，不运行 Top N 精细 LLM 报告'
     )
     
     return parser.parse_args()
@@ -1068,6 +1143,21 @@ def main() -> int:
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
     
     try:
+        # 模式0: 热门板块驱动选股
+        if args.screen_hot_sectors:
+            logger.info("模式: 热门板块驱动选股")
+            pipeline = StockAnalysisPipeline(
+                config=config,
+                max_workers=args.workers
+            )
+            pipeline.run_hot_sector_screening(
+                top_n=args.screen_top_n,
+                sector_count=args.screen_sector_count,
+                run_llm=not args.screen_no_llm and not args.dry_run,
+                send_notification=not args.no_notify,
+            )
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             logger.info("模式: 仅大盘复盘")

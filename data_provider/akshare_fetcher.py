@@ -23,7 +23,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 
 import pandas as pd
@@ -499,6 +499,137 @@ class AkshareFetcher(BaseFetcher):
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         
+        return df
+
+    @staticmethod
+    def _safe_float_value(value: Any, default: float = 0.0) -> float:
+        try:
+            if pd.isna(value):
+                return default
+            if isinstance(value, str):
+                value = value.replace("%", "").replace(",", "").strip()
+                if value in {"", "-", "--"}:
+                    return default
+            return float(value)
+        except Exception:
+            return default
+
+    def get_hot_sectors(self, sector_count: int = 5, include_concepts: bool = True) -> List[Dict[str, Any]]:
+        """获取当日热门行业/概念板块，用于主动选股粗筛。"""
+        sector_sources = [("industry", "ak.stock_board_industry_name_em", ak.stock_board_industry_name_em)]
+        if include_concepts:
+            sector_sources.append(("concept", "ak.stock_board_concept_name_em", ak.stock_board_concept_name_em))
+
+        sectors: List[Dict[str, Any]] = []
+        for sector_type, api_name, fetch_func in sector_sources:
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                with self._without_proxy():
+                    df = self._fetch_with_retry(api_name, fetch_func)
+                if df is None or df.empty:
+                    continue
+
+                for _, row in df.iterrows():
+                    name = str(row.get("板块名称") or row.get("名称") or "").strip()
+                    if not name:
+                        continue
+                    sectors.append(
+                        {
+                            "name": name,
+                            "code": str(row.get("板块代码") or row.get("代码") or ""),
+                            "sector_type": sector_type,
+                            "rank": int(self._safe_float_value(row.get("排名"), len(sectors) + 1)),
+                            "change_pct": self._safe_float_value(row.get("涨跌幅")),
+                            "turnover_rate": self._safe_float_value(row.get("换手率")),
+                            "amount": self._safe_float_value(row.get("成交额")),
+                            "leading_stock": str(row.get("领涨股票") or ""),
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"[板块] 获取{sector_type}热门板块失败: {e}")
+
+        sectors.sort(key=lambda item: item.get("change_pct", 0.0), reverse=True)
+        return sectors[: max(1, sector_count)]
+
+    def get_sector_constituents(self, sector_name: str, sector_type: str = "industry") -> List[Dict[str, Any]]:
+        """获取行业/概念板块成分股。"""
+        fetch_func = ak.stock_board_concept_cons_em if sector_type == "concept" else ak.stock_board_industry_cons_em
+        api_name = "ak.stock_board_concept_cons_em" if sector_type == "concept" else "ak.stock_board_industry_cons_em"
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        with self._without_proxy():
+            df = self._fetch_with_retry(api_name, lambda: fetch_func(symbol=sector_name))
+
+        constituents: List[Dict[str, Any]] = []
+        if df is None or df.empty:
+            return constituents
+
+        for _, row in df.iterrows():
+            code = str(row.get("代码") or "").strip()
+            name = str(row.get("名称") or "").strip()
+            if not code or not name:
+                continue
+            constituents.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "price": self._safe_float_value(row.get("最新价")),
+                    "change_pct": self._safe_float_value(row.get("涨跌幅")),
+                    "amount": self._safe_float_value(row.get("成交额")),
+                    "turnover_rate": self._safe_float_value(row.get("换手率")),
+                    "amplitude": self._safe_float_value(row.get("振幅")),
+                    "high": self._safe_float_value(row.get("最高")),
+                    "low": self._safe_float_value(row.get("最低")),
+                    "open": self._safe_float_value(row.get("今开")),
+                }
+            )
+        return constituents
+
+    def get_sector_daily_data(
+        self,
+        sector_name: str,
+        sector_type: str = "industry",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 120,
+    ) -> pd.DataFrame:
+        """获取行业/概念板块日线数据，用于板块相对强弱。"""
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
+            start_date = start_dt.strftime("%Y-%m-%d")
+
+        if sector_type == "concept":
+            fetch_func = ak.stock_board_concept_hist_em
+            api_name = "ak.stock_board_concept_hist_em"
+            kwargs = {"symbol": sector_name, "period": "daily"}
+        else:
+            fetch_func = ak.stock_board_industry_hist_em
+            api_name = "ak.stock_board_industry_hist_em"
+            kwargs = {"symbol": sector_name, "period": "日k"}
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        with self._without_proxy():
+            raw_df = self._fetch_with_retry(
+                api_name,
+                lambda: fetch_func(
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    adjust="",
+                    **kwargs,
+                ),
+            )
+
+        if raw_df is None or raw_df.empty:
+            raise DataFetchError(f"Akshare 未获取到板块 {sector_name} 的日线数据")
+
+        df = self._normalize_data(raw_df, sector_name)
+        df = self._clean_data(df)
+        df = self._calculate_indicators(df)
         return df
 
     def get_index_daily_data(
