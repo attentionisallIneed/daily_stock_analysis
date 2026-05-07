@@ -29,6 +29,8 @@ import sys
 from datetime import datetime, date, timedelta
 from typing import Optional
 
+__test__ = False
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,

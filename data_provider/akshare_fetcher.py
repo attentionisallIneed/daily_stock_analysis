@@ -749,6 +749,26 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(f"[财务] 获取 {stock_code} 财务指标失败: {e}")
             return []
 
+    def get_restricted_release_queue(self, stock_code: str, max_items: int = 20) -> List[Dict[str, Any]]:
+        """获取个股限售解禁批次。"""
+        if _is_etf_code(stock_code):
+            logger.debug(f"[解禁跳过] {stock_code} 是 ETF/基金，跳过限售解禁查询")
+            return []
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(f"[API调用] ak.stock_restricted_release_queue_em(symbol={stock_code})")
+            with self._without_proxy():
+                df = self._fetch_with_retry(
+                    "ak.stock_restricted_release_queue_em",
+                    lambda: ak.stock_restricted_release_queue_em(symbol=stock_code),
+                )
+            return self._dataframe_to_records(df, max_items=max_items)
+        except Exception as e:
+            logger.warning(f"[解禁] 获取 {stock_code} 限售解禁失败: {e}")
+            return []
+
     @staticmethod
     def _to_em_stock_symbol(stock_code: str) -> str:
         """转换为东方财富财务接口需要的 301389.SZ / 600519.SH 格式。"""
