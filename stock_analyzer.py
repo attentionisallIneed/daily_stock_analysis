@@ -12,7 +12,7 @@
 
 技术标准：
 - 多头排列：MA5 > MA10 > MA20
-- 乖离率：(Close - MA5) / MA5 < 5%（不追高）
+- 乖离率：(Close - MA5) / MA5 低于自适应纪律线（默认最高 5%）
 - 量能形态：缩量回调优先
 """
 
@@ -88,6 +88,13 @@ class TrendAnalysisResult:
     volume_status: VolumeStatus = VolumeStatus.NORMAL
     volume_ratio_5d: float = 0.0     # 当日成交量/5日均量
     volume_trend: str = ""           # 量能趋势描述
+
+    # 波动率自适应参数
+    atr_20: float = 0.0               # 20日平均真实波幅
+    atr_pct: float = 0.0              # ATR / 现价 * 100
+    volatility_20d: float = 0.0       # 近20日收益率标准差（%）
+    adaptive_bias_threshold: float = 5.0
+    adaptive_support_tolerance: float = 0.02
     
     # 支撑压力
     support_ma5: bool = False        # MA5 是否构成支撑
@@ -137,6 +144,11 @@ class TrendAnalysisResult:
             'volume_status': self.volume_status.value,
             'volume_ratio_5d': self.volume_ratio_5d,
             'volume_trend': self.volume_trend,
+            'atr_20': self.atr_20,
+            'atr_pct': self.atr_pct,
+            'volatility_20d': self.volatility_20d,
+            'adaptive_bias_threshold': self.adaptive_bias_threshold,
+            'adaptive_support_tolerance': self.adaptive_support_tolerance,
             'support_ma5': self.support_ma5,
             'support_ma10': self.support_ma10,
             'support_levels': self.support_levels,
@@ -167,16 +179,20 @@ class StockTrendAnalyzer:
     
     基于用户交易理念实现：
     1. 趋势判断 - MA5>MA10>MA20 多头排列
-    2. 乖离率检测 - 不追高，偏离 MA5 超过 5% 不买
+    2. 乖离率检测 - 不追高，偏离 MA5 超过自适应纪律线不买
     3. 量能分析 - 偏好缩量回调
     4. 买点识别 - 回踩 MA5/MA10 支撑
     """
     
     # 交易参数配置
     BIAS_THRESHOLD = 5.0        # 乖离率阈值（%），超过此值不买入
+    ATR_PERIOD = 20
+    ATR_BIAS_MULTIPLIER = 1.2
+    ATR_STOP_MULTIPLIER = 1.5
     VOLUME_SHRINK_RATIO = 0.7   # 缩量判断阈值（当日量/5日均量）
     VOLUME_HEAVY_RATIO = 1.5    # 放量判断阈值
     MA_SUPPORT_TOLERANCE = 0.02  # MA 支撑判断容忍度（2%）
+    MIN_SUPPORT_TOLERANCE = 0.01  # 低波动标的支撑容忍度下限（1%）
     ACCOUNT_RISK_BUDGET_PCT = 1.0  # 单票单次交易最大组合亏损预算（%）
     MAX_POSITION_PCT = 30.0
     MARKET_POSITION_MULTIPLIERS = {
@@ -222,6 +238,7 @@ class StockTrendAnalyzer:
         result.ma10 = float(latest['MA10'])
         result.ma20 = float(latest['MA20'])
         result.ma60 = float(latest.get('MA60', 0))
+        self._analyze_volatility(df, result)
         
         # 1. 趋势判断
         self._analyze_trend(df, result)
@@ -328,7 +345,7 @@ class StockTrendAnalyzer:
         )
     
     def _calculate_mas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算均线"""
+        """计算均线和波动率指标。"""
         df = df.copy()
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
@@ -337,7 +354,52 @@ class StockTrendAnalyzer:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
             df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
+
+        prev_close = df['close'].shift(1)
+        true_ranges = pd.concat(
+            [
+                df['high'] - df['low'],
+                (df['high'] - prev_close).abs(),
+                (df['low'] - prev_close).abs(),
+            ],
+            axis=1,
+        )
+        df['TR'] = true_ranges.max(axis=1)
+        df['ATR20'] = df['TR'].rolling(window=self.ATR_PERIOD).mean()
+        df['VOLATILITY20'] = df['close'].pct_change().rolling(window=20).std() * 100
         return df
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
+        """Safely coerce pandas/numeric values to a plain float."""
+        try:
+            if pd.isna(value):
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _analyze_volatility(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """根据 ATR 生成自适应乖离阈值、支撑容忍度和止损参考。"""
+        latest = df.iloc[-1]
+        result.atr_20 = self._to_float(latest.get('ATR20'))
+        result.volatility_20d = self._to_float(latest.get('VOLATILITY20'))
+
+        if result.current_price > 0 and result.atr_20 > 0:
+            result.atr_pct = round(result.atr_20 / result.current_price * 100, 2)
+
+        if result.atr_pct > 0:
+            result.adaptive_bias_threshold = round(
+                min(self.BIAS_THRESHOLD, self.ATR_BIAS_MULTIPLIER * result.atr_pct),
+                2,
+            )
+            result.adaptive_support_tolerance = round(
+                max(self.MIN_SUPPORT_TOLERANCE, result.atr_pct / 100 * 0.5),
+                4,
+            )
+        else:
+            result.adaptive_bias_threshold = self.BIAS_THRESHOLD
+            result.adaptive_support_tolerance = self.MA_SUPPORT_TOLERANCE
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -424,7 +486,7 @@ class StockTrendAnalyzer:
         
         乖离率 = (现价 - 均线) / 均线 * 100%
         
-        严进策略：乖离率超过 5% 不追高
+        严进策略：乖离率超过自适应纪律线不追高
         """
         price = result.current_price
         
@@ -480,18 +542,19 @@ class StockTrendAnalyzer:
         买点偏好：回踩 MA5/MA10 获得支撑
         """
         price = result.current_price
+        support_tolerance = result.adaptive_support_tolerance or self.MA_SUPPORT_TOLERANCE
         
         # 检查是否在 MA5 附近获得支撑
         if result.ma5 > 0:
             ma5_distance = abs(price - result.ma5) / result.ma5
-            if ma5_distance <= self.MA_SUPPORT_TOLERANCE and price >= result.ma5:
+            if ma5_distance <= support_tolerance and price >= result.ma5:
                 result.support_ma5 = True
                 result.support_levels.append(result.ma5)
         
         # 检查是否在 MA10 附近获得支撑
         if result.ma10 > 0:
             ma10_distance = abs(price - result.ma10) / result.ma10
-            if ma10_distance <= self.MA_SUPPORT_TOLERANCE and price >= result.ma10:
+            if ma10_distance <= support_tolerance and price >= result.ma10:
                 result.support_ma10 = True
                 if result.ma10 not in result.support_levels:
                     result.support_levels.append(result.ma10)
@@ -509,15 +572,17 @@ class StockTrendAnalyzer:
     def _calculate_trade_plan(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """计算规则层买点、止损、目标位和盈亏比。"""
         price = result.current_price
+        bias_threshold = result.adaptive_bias_threshold or self.BIAS_THRESHOLD
+        support_tolerance = result.adaptive_support_tolerance or self.MA_SUPPORT_TOLERANCE
         valid_supports = [level for level in [result.ma5, result.ma10, result.ma20] if level > 0]
 
         if not valid_supports or price <= 0:
             return
 
-        if result.bias_ma5 >= self.BIAS_THRESHOLD:
+        if result.bias_ma5 >= bias_threshold:
             result.ideal_buy = round(result.ma5, 2)
         else:
-            nearby_supports = [level for level in valid_supports if abs(price - level) / level <= self.MA_SUPPORT_TOLERANCE]
+            nearby_supports = [level for level in valid_supports if abs(price - level) / level <= support_tolerance]
             result.ideal_buy = round(min(nearby_supports, key=lambda level: abs(price - level)) if nearby_supports else result.ma5, 2)
 
         if result.ma10 > 0 and result.ma10 != result.ideal_buy:
@@ -527,7 +592,8 @@ class StockTrendAnalyzer:
 
         recent_low = float(df['low'].iloc[-20:].min()) if len(df) >= 20 else 0.0
         ma20_stop = result.ma20 * 0.98 if result.ma20 > 0 else 0.0
-        stop_candidates = [level for level in [ma20_stop, recent_low * 0.98] if 0 < level < result.ideal_buy]
+        atr_stop = result.ideal_buy - self.ATR_STOP_MULTIPLIER * result.atr_20 if result.atr_20 > 0 else 0.0
+        stop_candidates = [level for level in [ma20_stop, recent_low * 0.98, atr_stop] if 0 < level < result.ideal_buy]
         if stop_candidates:
             result.stop_loss = round(max(stop_candidates), 2)
 
@@ -544,7 +610,10 @@ class StockTrendAnalyzer:
             result.risk_reward_ratio = round(reward / risk, 2)
 
         if result.stop_loss > 0:
-            result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或有效跌破MA20"
+            if result.atr_20 > 0:
+                result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或回撤超过1.5倍ATR"
+            else:
+                result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或有效跌破MA20"
         elif result.ma20 > 0:
             result.invalidation_condition = f"有效跌破MA20({result.ma20:.2f}元)"
 
@@ -568,6 +637,7 @@ class StockTrendAnalyzer:
         score = 0
         reasons = []
         risks = []
+        bias_threshold = result.adaptive_bias_threshold or self.BIAS_THRESHOLD
         
         # === 趋势评分（40分）===
         trend_scores = {
@@ -603,12 +673,12 @@ class StockTrendAnalyzer:
         elif bias < 2:
             score += 28
             reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，介入好时机")
-        elif bias < self.BIAS_THRESHOLD:
+        elif bias < bias_threshold:
             score += 20
-            reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，可小仓介入")
+            reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，未超过自适应追高线")
         else:
             score += 5
-            risks.append(f"❌ 乖离率过高({bias:.1f}%>5%)，严禁追高！")
+            risks.append(f"❌ 乖离率过高({bias:.1f}%>{bias_threshold:.1f}%)，严禁追高！")
         
         # === 量能评分（20分）===
         volume_scores = {
@@ -641,7 +711,7 @@ class StockTrendAnalyzer:
             else:
                 reasons.append(f"✅ {result.ma60_trend}")
 
-        if result.bias_ma5 >= self.BIAS_THRESHOLD:
+        if result.bias_ma5 >= bias_threshold:
             score = min(score, 59)
 
         if result.risk_reward_ratio > 0:
@@ -697,6 +767,9 @@ class StockTrendAnalyzer:
             f"   MA20: {result.ma20:.2f} (乖离 {result.bias_ma20:+.2f}%)",
             f"   MA60: {result.ma60:.2f} (相对 {result.price_vs_ma60:+.2f}%, 斜率 {result.ma60_slope:+.2f}%)",
             f"   中期趋势: {result.ma60_trend}",
+            f"   ATR20: {result.atr_20:.2f} ({result.atr_pct:.2f}%), "
+            f"追高线: {result.adaptive_bias_threshold:.2f}%, "
+            f"支撑容忍: {result.adaptive_support_tolerance * 100:.2f}%",
             f"",
             f"📊 量能分析: {result.volume_status.value}",
             f"   量比(vs5日): {result.volume_ratio_5d:.2f}",

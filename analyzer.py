@@ -199,11 +199,12 @@ class OpenAIAnalyzer:
 ## 核心交易理念（必须严格遵守）
 
 ### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
+- **绝对不追高**：当股价偏离 MA5 超过规则层纪律线时，坚决不买入
 - **乖离率公式**：(现价 - MA5) / MA5 × 100%
+- 纪律线由规则层计算：默认最高 5%，低波动标的会按 ATR 自动收紧
 - 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+- 乖离率 2% 至规则纪律线：只可小仓介入
+- 乖离率超过规则纪律线：严禁追高！直接判定为"观望"
 
 ### 2. 趋势交易（顺势而为）
 - **多头排列必须条件**：MA5 > MA10 > MA20
@@ -304,7 +305,7 @@ class OpenAIAnalyzer:
             },
             "action_checklist": [
                 "✅/⚠️/❌ 检查项1：多头排列",
-                "✅/⚠️/❌ 检查项2：乖离率<5%",
+                "✅/⚠️/❌ 检查项2：乖离率低于规则纪律线",
                 "✅/⚠️/❌ 检查项3：量能配合",
                 "✅/⚠️/❌ 检查项4：无重大利空",
                 "✅/⚠️/❌ 检查项5：筹码健康"
@@ -347,12 +348,12 @@ class OpenAIAnalyzer:
 
 ### 买入（60-79分）：
 - ✅ 多头排列或弱势多头
-- ✅ 乖离率 <5%
+- ✅ 乖离率低于规则纪律线
 - ✅ 量能正常
 - ⚪ 允许一项次要条件不满足
 
 ### 观望（40-59分）：
-- ⚠️ 乖离率 >5%（追高风险）
+- ⚠️ 乖离率超过规则纪律线（追高风险）
 - ⚠️ 均线缠绕趋势不明
 - ⚠️ 有风险事件
 
@@ -719,7 +720,10 @@ class OpenAIAnalyzer:
         # 添加趋势分析结果（基于交易理念的预判）
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
-            bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
+            bias_ma5 = float(trend.get('bias_ma5') or 0)
+            bias_threshold = float(trend.get('adaptive_bias_threshold') or 5)
+            support_tolerance_pct = float(trend.get('adaptive_support_tolerance') or 0.02) * 100
+            bias_warning = f"🚨 超过{bias_threshold:.2f}%，严禁追高！" if bias_ma5 > bias_threshold else "✅ 安全范围"
             support_levels = trend.get('support_levels') or []
             resistance_levels = trend.get('resistance_levels') or []
             support_text = ', '.join(f"{level:.2f}" for level in support_levels[:3]) if support_levels else '无'
@@ -735,6 +739,10 @@ class OpenAIAnalyzer:
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
+| ATR20 / ATR占比 | {trend.get('atr_20', 0):.2f} / {trend.get('atr_pct', 0):.2f}% | 用于自适应阈值和止损 |
+| 20日收益波动率 | {trend.get('volatility_20d', 0):.2f}% | 辅助识别波动环境 |
+| 自适应追高线 | {bias_threshold:.2f}% | 默认最高5%，低波动标的收紧 |
+| 自适应支撑容忍度 | {support_tolerance_pct:.2f}% | MA5/MA10支撑判定使用 |
 | 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
 | 规则支撑位 | {support_text} | 优先参考 MA5/MA10/MA20 附近支撑 |
 | 规则压力位 | {resistance_text} | 目标位优先参考近期压力 |
@@ -753,7 +761,7 @@ class OpenAIAnalyzer:
 | 中期趋势 | {trend.get('ma60_trend', '未知')} | MA60斜率 {trend.get('ma60_slope', 0):+.2f}% |
 
 ### 硬规则约束（最终 JSON 必须服从）
-- 若乖离率(MA5) > 5%，operation_advice 不得输出“买入/加仓/强烈买入”，必须以“观望”为主。
+- 若乖离率(MA5) > 自适应追高线（当前{bias_threshold:.2f}%），operation_advice 不得输出“买入/加仓/强烈买入”，必须以“观望”为主。
 - 若趋势状态为空头排列/强势空头，operation_advice 不得输出买入类建议。
 - 若筹码获利比例过高且筹码分散，必须在 risk_warning 和 risk_alerts 中明确提示获利盘兑现风险。
 - 买点、止损、目标位、盈亏比必须使用规则层给出的数值，LLM 只解释来源，不得自行创造点位。
@@ -810,7 +818,7 @@ class OpenAIAnalyzer:
 
 ### 重点关注（必须明确回答）：
 1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
-2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
+2. ❓ 当前乖离率是否在安全范围内（低于规则层自适应追高线）？—— 超过纪律线必须标注"严禁追高"
 3. ❓ 量能是否配合（缩量回调/放量突破）？
 4. ❓ 筹码结构是否健康？
 5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
@@ -947,6 +955,7 @@ class OpenAIAnalyzer:
         position_note = str(trend.get('position_note') or '')
         single_trade_risk_pct = float(trend.get('single_trade_risk_pct') or 0)
         max_position_by_risk_pct = float(trend.get('max_position_by_risk_pct') or 0)
+        bias_threshold = float(trend.get('adaptive_bias_threshold') or 5)
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -960,12 +969,12 @@ class OpenAIAnalyzer:
             if result.operation_advice in buy_advices:
                 result.sentiment_score = min(result.sentiment_score, 69)
             warnings.append(f"规则盈亏比为{risk_reward_ratio:.2f}，仅适合低仓试探")
-        if bias_ma5 > 5 and result.operation_advice in buy_advices:
+        if bias_ma5 > bias_threshold and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
             result.trend_prediction = '震荡'
             result.sentiment_score = min(result.sentiment_score, 59)
             result.confidence_level = '中'
-            warnings.append(f"乖离率MA5为{bias_ma5:.2f}%，超过5%纪律线，禁止追高")
+            warnings.append(f"乖离率MA5为{bias_ma5:.2f}%，超过{bias_threshold:.2f}%纪律线，禁止追高")
 
         if any(status in trend_status for status in ['空头排列', '强势空头']) and result.operation_advice in buy_advices:
             result.operation_advice = '观望'

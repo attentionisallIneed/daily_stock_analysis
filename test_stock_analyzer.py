@@ -54,9 +54,36 @@ def test_high_ma5_bias_keeps_no_chasing_discipline():
 
     result = StockTrendAnalyzer().analyze(_make_df(closes), "000001")
 
-    assert result.bias_ma5 >= StockTrendAnalyzer.BIAS_THRESHOLD
+    assert result.bias_ma5 >= result.adaptive_bias_threshold
     assert result.signal_score <= 59
     assert result.buy_signal not in {BuySignal.BUY, BuySignal.STRONG_BUY}
+
+
+def test_low_volatility_tightens_bias_threshold_and_blocks_chasing():
+    closes = [10.0] * 79 + [10.3]
+    highs = [price * 1.001 for price in closes]
+    lows = [price * 0.999 for price in closes]
+
+    result = StockTrendAnalyzer().analyze(_make_df(closes, highs=highs, lows=lows), "000001")
+
+    assert 0 < result.adaptive_bias_threshold < StockTrendAnalyzer.BIAS_THRESHOLD
+    assert result.bias_ma5 > result.adaptive_bias_threshold
+    assert result.signal_score <= 59
+    assert result.buy_signal not in {BuySignal.BUY, BuySignal.STRONG_BUY}
+
+
+def test_atr_stop_tightens_rule_stop_for_low_volatility_stock():
+    closes = [10.0] * 79 + [10.05]
+    highs = [price * 1.001 for price in closes]
+    lows = [price * 0.999 for price in closes]
+
+    result = StockTrendAnalyzer().analyze(_make_df(closes, highs=highs, lows=lows), "000001")
+
+    atr_stop = round(result.ideal_buy - StockTrendAnalyzer.ATR_STOP_MULTIPLIER * result.atr_20, 2)
+    assert result.atr_20 > 0
+    assert result.stop_loss == atr_stop
+    assert result.stop_loss > round(result.ma20 * 0.98, 2)
+    assert "ATR" in result.invalidation_condition
 
 
 def test_position_model_generates_rule_position_from_market_and_risk_reward():
