@@ -56,10 +56,40 @@ class BuySignal(Enum):
     STRONG_SELL = "强烈卖出"      # 趋势破坏
 
 
+class InstrumentType(Enum):
+    """分析标的类型。"""
+    STOCK = "普通股票"
+    SECTOR_ETF = "行业ETF"
+    BROAD_ETF = "宽基ETF"
+    INDEX = "指数"
+
+
+@dataclass(frozen=True)
+class StrategyProfile:
+    """不同品种使用的规则参数档案。"""
+
+    instrument_type: InstrumentType
+    label: str
+    max_bias_threshold: float = 5.0
+    atr_bias_multiplier: float = 1.2
+    support_tolerance_multiplier: float = 0.5
+    min_support_tolerance: float = 0.01
+    atr_stop_multiplier: float = 1.5
+    breakout_max_bias: float = 8.0
+    breakout_score_multiplier: float = 1.0
+    relative_strength_multiplier: float = 1.0
+    max_position_pct: float = 30.0
+    account_risk_budget_pct: float = 1.0
+    notes: str = ""
+
+
 @dataclass
 class TrendAnalysisResult:
     """趋势分析结果"""
     code: str
+    instrument_type: InstrumentType = InstrumentType.STOCK
+    strategy_profile: str = "普通股票趋势回踩策略"
+    strategy_notes: List[str] = field(default_factory=list)
     
     # 趋势判断
     trend_status: TrendStatus = TrendStatus.CONSOLIDATION
@@ -122,6 +152,23 @@ class TrendAnalysisResult:
     support_confirmation: str = ""
     resistance_levels: List[float] = field(default_factory=list)
     support_levels: List[float] = field(default_factory=list)
+
+    # 突破与趋势加速形态
+    pattern_signal: str = "回踩优先"
+    breakout_status: str = "无明确突破"
+    breakout_level: float = 0.0
+    breakout_score: int = 0
+    breakout_valid: bool = False
+    breakout_extension_threshold: float = 0.0
+    new_high_20d: bool = False
+    volume_breakout: bool = False
+    platform_breakout: bool = False
+    ma_compression_breakout: bool = False
+    limit_up_pullback: bool = False
+    breakout_retest_valid: bool = False
+    trend_acceleration: bool = False
+    breakout_reasons: List[str] = field(default_factory=list)
+    breakout_risks: List[str] = field(default_factory=list)
     
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
@@ -147,6 +194,9 @@ class TrendAnalysisResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             'code': self.code,
+            'instrument_type': self.instrument_type.value,
+            'strategy_profile': self.strategy_profile,
+            'strategy_notes': self.strategy_notes,
             'trend_status': self.trend_status.value,
             'ma_alignment': self.ma_alignment,
             'trend_strength': self.trend_strength,
@@ -193,6 +243,21 @@ class TrendAnalysisResult:
             'support_confirmation': self.support_confirmation,
             'support_levels': self.support_levels,
             'resistance_levels': self.resistance_levels,
+            'pattern_signal': self.pattern_signal,
+            'breakout_status': self.breakout_status,
+            'breakout_level': self.breakout_level,
+            'breakout_score': self.breakout_score,
+            'breakout_valid': self.breakout_valid,
+            'breakout_extension_threshold': self.breakout_extension_threshold,
+            'new_high_20d': self.new_high_20d,
+            'volume_breakout': self.volume_breakout,
+            'platform_breakout': self.platform_breakout,
+            'ma_compression_breakout': self.ma_compression_breakout,
+            'limit_up_pullback': self.limit_up_pullback,
+            'breakout_retest_valid': self.breakout_retest_valid,
+            'trend_acceleration': self.trend_acceleration,
+            'breakout_reasons': self.breakout_reasons,
+            'breakout_risks': self.breakout_risks,
             'buy_signal': self.buy_signal.value,
             'signal_score': self.signal_score,
             'signal_reasons': self.signal_reasons,
@@ -241,6 +306,9 @@ class StockTrendAnalyzer:
     RS_SECTOR_THRESHOLD = 2.0
     ACCOUNT_RISK_BUDGET_PCT = 1.0  # 单票单次交易最大组合亏损预算（%）
     MAX_POSITION_PCT = 30.0
+    BREAKOUT_VOLUME_RATIO = 1.3
+    BREAKOUT_RETEST_TOLERANCE_MULTIPLIER = 1.5
+    BREAKOUT_SCORE_CAP = 15
     MARKET_POSITION_MULTIPLIERS = {
         "强势": 1.0,
         "偏强": 0.8,
@@ -252,6 +320,58 @@ class StockTrendAnalyzer:
     def __init__(self):
         """初始化分析器"""
         pass
+
+    STRATEGY_PROFILES = {
+        InstrumentType.STOCK: StrategyProfile(
+            instrument_type=InstrumentType.STOCK,
+            label="普通股票趋势回踩策略",
+            notes="重视筹码、公告、财报、减持和个股流动性风险；突破形态必须有量能或回踩确认。",
+        ),
+        InstrumentType.SECTOR_ETF: StrategyProfile(
+            instrument_type=InstrumentType.SECTOR_ETF,
+            label="行业ETF板块趋势策略",
+            max_bias_threshold=5.5,
+            atr_bias_multiplier=1.3,
+            support_tolerance_multiplier=0.6,
+            atr_stop_multiplier=1.4,
+            breakout_max_bias=7.0,
+            breakout_score_multiplier=1.15,
+            relative_strength_multiplier=1.2,
+            max_position_pct=35.0,
+            account_risk_budget_pct=0.9,
+            notes="不使用筹码和个股财报作为核心约束，更重视行业相对强弱、板块热度和流动性。",
+        ),
+        InstrumentType.BROAD_ETF: StrategyProfile(
+            instrument_type=InstrumentType.BROAD_ETF,
+            label="宽基ETF市场环境策略",
+            max_bias_threshold=4.0,
+            atr_bias_multiplier=1.1,
+            support_tolerance_multiplier=0.45,
+            min_support_tolerance=0.008,
+            atr_stop_multiplier=1.3,
+            breakout_max_bias=5.5,
+            breakout_score_multiplier=0.9,
+            relative_strength_multiplier=1.1,
+            max_position_pct=40.0,
+            account_risk_budget_pct=0.8,
+            notes="更重视大盘环境、成交额和市场宽度；低波动宽基不放宽追高纪律。",
+        ),
+        InstrumentType.INDEX: StrategyProfile(
+            instrument_type=InstrumentType.INDEX,
+            label="指数观察策略",
+            max_bias_threshold=4.0,
+            atr_bias_multiplier=1.0,
+            support_tolerance_multiplier=0.45,
+            min_support_tolerance=0.008,
+            atr_stop_multiplier=1.3,
+            breakout_max_bias=5.0,
+            breakout_score_multiplier=0.8,
+            relative_strength_multiplier=1.0,
+            max_position_pct=0.0,
+            account_risk_budget_pct=0.0,
+            notes="指数仅用于市场状态和相对强弱观察，不直接输出开仓仓位。",
+        ),
+    }
     
     def analyze(
         self,
@@ -260,6 +380,8 @@ class StockTrendAnalyzer:
         benchmark_df: Optional[pd.DataFrame] = None,
         sector_df: Optional[pd.DataFrame] = None,
         sector_name: str = "",
+        security_name: str = "",
+        instrument_type: Optional[str | InstrumentType] = None,
     ) -> TrendAnalysisResult:
         """
         分析股票趋势
@@ -270,11 +392,15 @@ class StockTrendAnalyzer:
             benchmark_df: 可选的大盘/宽基指数日线数据，用于计算相对大盘强弱
             sector_df: 可选的行业/板块日线数据，用于计算相对行业强弱
             sector_name: 可选的行业/板块名称
+            security_name: 可选标的名称，用于区分 ETF、指数与普通股票
+            instrument_type: 可选显式品种类型，支持普通股票/行业ETF/宽基ETF/指数
             
         Returns:
             TrendAnalysisResult 分析结果
         """
-        result = TrendAnalysisResult(code=code)
+        resolved_type = self.infer_instrument_type(code, security_name, instrument_type)
+        result = TrendAnalysisResult(code=code, instrument_type=resolved_type)
+        self._apply_strategy_profile(result)
         
         if df is None or df.empty or len(df) < 20:
             logger.warning(f"{code} 数据不足，无法进行趋势分析")
@@ -318,6 +444,9 @@ class StockTrendAnalyzer:
         # 4. 支撑压力分析
         self._analyze_support_resistance(df, result)
 
+        # 4.5 突破与趋势加速形态
+        self._analyze_breakout_patterns(df, result)
+
         # 5. 规则层交易计划
         self._calculate_trade_plan(df, result)
 
@@ -329,6 +458,58 @@ class StockTrendAnalyzer:
         
         return result
 
+    @classmethod
+    def infer_instrument_type(
+        cls,
+        code: str,
+        security_name: str = "",
+        instrument_type: Optional[str | InstrumentType] = None,
+    ) -> InstrumentType:
+        """根据显式参数、代码段和名称推断标的类型。"""
+        if isinstance(instrument_type, InstrumentType):
+            return instrument_type
+        if isinstance(instrument_type, str) and instrument_type.strip():
+            normalized = instrument_type.strip().lower()
+            mapping = {
+                "stock": InstrumentType.STOCK,
+                "普通股票": InstrumentType.STOCK,
+                "sector_etf": InstrumentType.SECTOR_ETF,
+                "行业etf": InstrumentType.SECTOR_ETF,
+                "industry_etf": InstrumentType.SECTOR_ETF,
+                "broad_etf": InstrumentType.BROAD_ETF,
+                "宽基etf": InstrumentType.BROAD_ETF,
+                "index": InstrumentType.INDEX,
+                "指数": InstrumentType.INDEX,
+            }
+            if normalized in mapping:
+                return mapping[normalized]
+
+        code = str(code or "").strip()
+        name = str(security_name or "").upper()
+        broad_keywords = [
+            "沪深300", "中证500", "中证1000", "中证A500", "上证50", "科创50",
+            "创业板", "深证100", "A50", "红利", "宽基", "指数",
+        ]
+        index_keywords = ["上证指数", "深证成指", "创业板指", "科创50", "沪深300", "中证"]
+        etf_prefixes = ("51", "52", "56", "58", "15", "16", "18")
+
+        if any(keyword.upper() in name for keyword in index_keywords) and "ETF" not in name:
+            return InstrumentType.INDEX
+        if len(code) == 6 and code.startswith(etf_prefixes):
+            if any(keyword.upper() in name for keyword in broad_keywords):
+                return InstrumentType.BROAD_ETF
+            return InstrumentType.SECTOR_ETF
+        return InstrumentType.STOCK
+
+    def _strategy_profile_for(self, instrument_type: InstrumentType) -> StrategyProfile:
+        return self.STRATEGY_PROFILES.get(instrument_type, self.STRATEGY_PROFILES[InstrumentType.STOCK])
+
+    def _apply_strategy_profile(self, result: TrendAnalysisResult) -> StrategyProfile:
+        profile = self._strategy_profile_for(result.instrument_type)
+        result.strategy_profile = profile.label
+        result.strategy_notes = [profile.notes] if profile.notes else []
+        return profile
+
     def apply_position_model(
         self,
         result: TrendAnalysisResult,
@@ -337,7 +518,8 @@ class StockTrendAnalyzer:
     ) -> TrendAnalysisResult:
         """根据系统评分、大盘环境、盈亏比和单票风险预算计算建议仓位。"""
         market_status = market_status or "震荡"
-        risk_budget = account_risk_budget_pct or self.ACCOUNT_RISK_BUDGET_PCT
+        profile = self._apply_strategy_profile(result)
+        risk_budget = account_risk_budget_pct if account_risk_budget_pct is not None else profile.account_risk_budget_pct
 
         result.base_position_pct = self._score_to_base_position(result.signal_score)
         result.market_position_multiplier = self.MARKET_POSITION_MULTIPLIERS.get(market_status, 0.5)
@@ -359,7 +541,10 @@ class StockTrendAnalyzer:
         if raw_position <= 0:
             result.final_position_pct = 0.0
         elif result.max_position_by_risk_pct > 0:
-            result.final_position_pct = round(min(raw_position, result.max_position_by_risk_pct, self.MAX_POSITION_PCT), 1)
+            result.final_position_pct = round(
+                min(raw_position, result.max_position_by_risk_pct, profile.max_position_pct),
+                1,
+            )
         else:
             result.final_position_pct = 0.0
 
@@ -447,6 +632,7 @@ class StockTrendAnalyzer:
     def _analyze_volatility(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """根据 ATR 生成自适应乖离阈值、支撑容忍度和止损参考。"""
         latest = df.iloc[-1]
+        profile = self._strategy_profile_for(result.instrument_type)
         result.atr_20 = self._to_float(latest.get('ATR20'))
         result.volatility_20d = self._to_float(latest.get('VOLATILITY20'))
 
@@ -455,16 +641,16 @@ class StockTrendAnalyzer:
 
         if result.atr_pct > 0:
             result.adaptive_bias_threshold = round(
-                min(self.BIAS_THRESHOLD, self.ATR_BIAS_MULTIPLIER * result.atr_pct),
+                min(profile.max_bias_threshold, profile.atr_bias_multiplier * result.atr_pct),
                 2,
             )
             result.adaptive_support_tolerance = round(
-                max(self.MIN_SUPPORT_TOLERANCE, result.atr_pct / 100 * 0.5),
+                max(profile.min_support_tolerance, result.atr_pct / 100 * profile.support_tolerance_multiplier),
                 4,
             )
         else:
-            result.adaptive_bias_threshold = self.BIAS_THRESHOLD
-            result.adaptive_support_tolerance = self.MA_SUPPORT_TOLERANCE
+            result.adaptive_bias_threshold = profile.max_bias_threshold
+            result.adaptive_support_tolerance = max(profile.min_support_tolerance, self.MA_SUPPORT_TOLERANCE)
 
     def _analyze_relative_strength(
         self,
@@ -754,9 +940,143 @@ class StockTrendAnalyzer:
         
         # 近期高点作为压力
         if len(df) >= 20:
-            recent_high = df['high'].iloc[-20:].max()
+            recent_high_window = df['high'].iloc[-21:-1] if len(df) >= 21 else df['high'].iloc[:-1]
+            recent_high = recent_high_window.max() if not recent_high_window.empty else 0
             if recent_high > price:
                 result.resistance_levels.append(recent_high)
+
+    def _analyze_breakout_patterns(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """识别突破、趋势加速和涨停后整理形态，和回踩买点分开评分。"""
+        profile = self._strategy_profile_for(result.instrument_type)
+        bias_threshold = result.adaptive_bias_threshold or profile.max_bias_threshold
+        result.breakout_extension_threshold = round(
+            max(
+                bias_threshold,
+                min(profile.breakout_max_bias, max(bias_threshold + 1.5, bias_threshold * 1.4)),
+            ),
+            2,
+        )
+
+        if df is None or len(df) < 30:
+            return
+
+        latest = df.iloc[-1]
+        close = result.current_price
+        high = self._to_float(latest.get('high'))
+        low = self._to_float(latest.get('low'))
+        prior_window = df.iloc[-21:-1] if len(df) >= 21 else df.iloc[:-1]
+        if prior_window.empty:
+            return
+
+        prior_high = self._to_float(prior_window['high'].max())
+        prior_low = self._to_float(prior_window['low'].min())
+        if prior_high <= 0 or prior_low <= 0 or close <= 0:
+            return
+
+        result.breakout_level = round(prior_high, 2)
+        platform_range_pct = (prior_high - prior_low) / prior_low * 100
+        platform_threshold = max(6.0, min(12.0, (result.atr_pct or 3.0) * 3.0))
+        retest_tolerance = (
+            result.adaptive_support_tolerance or self.MA_SUPPORT_TOLERANCE
+        ) * self.BREAKOUT_RETEST_TOLERANCE_MULTIPLIER
+
+        result.new_high_20d = close > prior_high and high > prior_high
+        result.volume_breakout = (
+            result.new_high_20d
+            and result.volume_ratio_5d >= self.BREAKOUT_VOLUME_RATIO
+            and close >= prior_high * 1.003
+        )
+        result.platform_breakout = result.volume_breakout and platform_range_pct <= platform_threshold
+        older_window = df.iloc[-31:-6] if len(df) >= 31 else df.iloc[:-6]
+        recent_after_level = df.iloc[-6:-1] if len(df) >= 6 else df.iloc[:-1]
+        retest_level = self._to_float(older_window['high'].max()) if not older_window.empty else 0.0
+        recent_close_high = (
+            self._to_float(recent_after_level['close'].max()) if not recent_after_level.empty else 0.0
+        )
+        result.breakout_retest_valid = (
+            retest_level > 0
+            and recent_close_high >= retest_level * 1.003
+            and low <= retest_level * (1 + retest_tolerance)
+            and close >= retest_level * (1 - retest_tolerance)
+            and close >= result.ma20
+        )
+        if result.breakout_retest_valid and not result.new_high_20d:
+            result.breakout_level = round(retest_level, 2)
+
+        if len(df) >= 35:
+            compression_row = df.iloc[-10]
+            prev_ma20 = self._to_float(compression_row.get('MA20'))
+            prev_ma5 = self._to_float(compression_row.get('MA5'))
+            prev_spread = abs(prev_ma5 - prev_ma20) / prev_ma20 * 100 if prev_ma20 > 0 else 0.0
+            curr_spread = (result.ma5 - result.ma20) / result.ma20 * 100 if result.ma20 > 0 else 0.0
+            result.ma_compression_breakout = (
+                prev_spread <= 3.0
+                and result.ma5 > result.ma10 > result.ma20
+                and curr_spread >= prev_spread + 1.0
+                and close >= prior_high * 0.995
+            )
+
+        pct_change = df['close'].pct_change() * 100
+        recent_limit_up = bool((pct_change.iloc[-6:-1] >= 9.5).any()) if len(pct_change) >= 6 else False
+        result.limit_up_pullback = (
+            recent_limit_up
+            and close >= result.ma5
+            and result.volume_ratio_5d <= 1.1
+            and not result.ma20_breakdown
+        )
+
+        curr_spread = (result.ma5 - result.ma20) / result.ma20 * 100 if result.ma20 > 0 else 0.0
+        prev_row = df.iloc[-5] if len(df) >= 5 else latest
+        prev_ma20 = self._to_float(prev_row.get('MA20'))
+        prev_spread = (
+            (self._to_float(prev_row.get('MA5')) - prev_ma20) / prev_ma20 * 100
+            if prev_ma20 > 0
+            else 0.0
+        )
+        result.trend_acceleration = (
+            result.trend_status == TrendStatus.STRONG_BULL
+            and result.volume_ratio_5d >= 1.2
+            and result.new_high_20d
+            and curr_spread > prev_spread
+        )
+
+        raw_score = 0
+        reasons = []
+        if result.platform_breakout:
+            raw_score += 8
+            reasons.append(f"平台突破：20日箱体振幅{platform_range_pct:.1f}%后放量越过{prior_high:.2f}")
+        elif result.volume_breakout:
+            raw_score += 6
+            reasons.append(f"放量突破20日高点{prior_high:.2f}")
+        if result.ma_compression_breakout:
+            raw_score += 5
+            reasons.append("均线粘合后向上发散")
+        if result.breakout_retest_valid and not result.new_high_20d:
+            raw_score += 5
+            reasons.append(f"回踩突破位{retest_level:.2f}附近未破")
+        if result.limit_up_pullback:
+            raw_score += 4
+            reasons.append("涨停后缩量整理且守住短均线")
+        if result.trend_acceleration:
+            raw_score += 5
+            reasons.append("强势多头放量创高，趋势加速")
+
+        adjusted_score = int(round(raw_score * profile.breakout_score_multiplier))
+        result.breakout_score = max(0, min(self.BREAKOUT_SCORE_CAP, adjusted_score))
+        result.breakout_reasons = reasons
+        result.breakout_valid = result.breakout_score > 0 and not result.ma20_breakdown
+
+        if result.breakout_valid:
+            result.pattern_signal = "突破/趋势加速"
+            result.breakout_status = "；".join(reasons)
+        else:
+            result.pattern_signal = "回踩优先"
+            result.breakout_status = "无明确突破"
+
+        if result.breakout_valid and result.bias_ma5 >= result.breakout_extension_threshold:
+            result.breakout_risks.append(
+                f"突破后MA5乖离{result.bias_ma5:.1f}%超过延伸线{result.breakout_extension_threshold:.1f}%"
+            )
 
     def _count_ma_hold_days(self, df: pd.DataFrame, ma_column: str, days: int = 3) -> int:
         """统计最近连续几个交易日的最低价没有跌破指定均线。"""
@@ -774,6 +1094,7 @@ class StockTrendAnalyzer:
     def _calculate_trade_plan(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """计算规则层买点、止损、目标位和盈亏比。"""
         price = result.current_price
+        profile = self._strategy_profile_for(result.instrument_type)
         bias_threshold = result.adaptive_bias_threshold or self.BIAS_THRESHOLD
         support_tolerance = result.adaptive_support_tolerance or self.MA_SUPPORT_TOLERANCE
         valid_supports = [level for level in [result.ma5, result.ma10, result.ma20] if level > 0]
@@ -781,7 +1102,17 @@ class StockTrendAnalyzer:
         if not valid_supports or price <= 0:
             return
 
-        if result.bias_ma5 >= bias_threshold:
+        breakout_entry_allowed = (
+            result.breakout_valid
+            and result.breakout_level > 0
+            and result.bias_ma5 < result.breakout_extension_threshold
+        )
+        if breakout_entry_allowed:
+            if result.breakout_retest_valid:
+                result.ideal_buy = round(min(price, result.breakout_level * (1 + support_tolerance)), 2)
+            else:
+                result.ideal_buy = round(result.breakout_level, 2)
+        elif result.bias_ma5 >= bias_threshold:
             result.ideal_buy = round(result.ma5, 2)
         else:
             nearby_supports = [level for level in valid_supports if abs(price - level) / level <= support_tolerance]
@@ -794,8 +1125,13 @@ class StockTrendAnalyzer:
 
         recent_low = float(df['low'].iloc[-20:].min()) if len(df) >= 20 else 0.0
         ma20_stop = result.ma20 * 0.98 if result.ma20 > 0 else 0.0
-        atr_stop = result.ideal_buy - self.ATR_STOP_MULTIPLIER * result.atr_20 if result.atr_20 > 0 else 0.0
-        stop_candidates = [level for level in [ma20_stop, recent_low * 0.98, atr_stop] if 0 < level < result.ideal_buy]
+        atr_stop = result.ideal_buy - profile.atr_stop_multiplier * result.atr_20 if result.atr_20 > 0 else 0.0
+        breakout_stop = result.breakout_level * 0.97 if breakout_entry_allowed else 0.0
+        stop_candidates = [
+            level
+            for level in [ma20_stop, recent_low * 0.98, atr_stop, breakout_stop]
+            if 0 < level < result.ideal_buy
+        ]
         if stop_candidates:
             result.stop_loss = round(max(stop_candidates), 2)
 
@@ -813,9 +1149,13 @@ class StockTrendAnalyzer:
 
         if result.stop_loss > 0:
             if result.atr_20 > 0:
-                result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或回撤超过1.5倍ATR"
+                result.invalidation_condition = (
+                    f"跌破止损位{result.stop_loss:.2f}元或回撤超过{profile.atr_stop_multiplier:.1f}倍ATR"
+                )
             else:
                 result.invalidation_condition = f"跌破止损位{result.stop_loss:.2f}元或有效跌破MA20"
+            if breakout_entry_allowed:
+                result.invalidation_condition += f"，或突破位{result.breakout_level:.2f}失守"
         elif result.ma20 > 0:
             result.invalidation_condition = f"有效跌破MA20({result.ma20:.2f}元)"
 
@@ -839,7 +1179,10 @@ class StockTrendAnalyzer:
         score = 0
         reasons = []
         risks = []
+        profile = self._strategy_profile_for(result.instrument_type)
         bias_threshold = result.adaptive_bias_threshold or self.BIAS_THRESHOLD
+        if result.strategy_notes:
+            reasons.append(f"📌 品种策略：{result.instrument_type.value}，{result.strategy_profile}")
         
         # === 趋势评分（40分）===
         trend_scores = {
@@ -879,8 +1222,15 @@ class StockTrendAnalyzer:
             score += 20
             reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，未超过自适应追高线")
         else:
-            score += 5
-            risks.append(f"❌ 乖离率过高({bias:.1f}%>{bias_threshold:.1f}%)，严禁追高！")
+            if result.breakout_valid and bias < result.breakout_extension_threshold:
+                score += 14
+                risks.append(
+                    f"⚠️ 乖离率超过回踩纪律线({bias:.1f}%>{bias_threshold:.1f}%)，"
+                    "仅因有效突破进入突破策略评估"
+                )
+            else:
+                score += 5
+                risks.append(f"❌ 乖离率过高({bias:.1f}%>{bias_threshold:.1f}%)，严禁追高！")
         
         # === 量能评分（20分）===
         volume_scores = {
@@ -906,20 +1256,34 @@ class StockTrendAnalyzer:
             score += 5
             reasons.append("✅ MA10支撑有效（K线确认）")
 
+        # === 突破/趋势加速评分（独立于回踩买点评分）===
+        if result.breakout_score > 0:
+            score += result.breakout_score
+            reasons.append(
+                f"🚀 {result.breakout_status}（突破分{result.breakout_score:+d}，"
+                f"延伸线{result.breakout_extension_threshold:.1f}%）"
+            )
+        for risk in result.breakout_risks:
+            risks.append(f"⚠️ {risk}")
+
         # === 相对强弱评分（-10~+10分）===
         if result.relative_strength_score > 0:
-            score += result.relative_strength_score
+            adjusted_rs_score = int(round(result.relative_strength_score * profile.relative_strength_multiplier))
+            score += adjusted_rs_score
             reasons.append(
                 f"✅ 相对强弱{result.relative_strength_status}"
-                f"（RS {result.relative_strength_score:+d}）：{result.relative_strength_summary}"
+                f"（RS {result.relative_strength_score:+d}，品种调整{adjusted_rs_score:+d}）："
+                f"{result.relative_strength_summary}"
             )
         elif result.relative_strength_score < 0:
-            score += result.relative_strength_score
+            adjusted_rs_score = int(round(result.relative_strength_score * profile.relative_strength_multiplier))
+            score += adjusted_rs_score
             risks.append(
                 f"⚠️ 相对强弱{result.relative_strength_status}"
-                f"（RS {result.relative_strength_score:+d}）：{result.relative_strength_summary}"
+                f"（RS {result.relative_strength_score:+d}，品种调整{adjusted_rs_score:+d}）："
+                f"{result.relative_strength_summary}"
             )
-            if result.relative_strength_score <= -6:
+            if adjusted_rs_score <= -6:
                 score = min(score, 64)
 
         if result.current_price < result.ma5 and not (result.support_ma5 or result.support_ma10):
@@ -938,7 +1302,11 @@ class StockTrendAnalyzer:
                 reasons.append(f"✅ {result.ma60_trend}")
 
         if result.bias_ma5 >= bias_threshold:
-            score = min(score, 59)
+            if result.breakout_valid and result.bias_ma5 < result.breakout_extension_threshold:
+                score = min(score, 79)
+                risks.append("⚠️ 有效突破可区别于普通追高，但仅按突破策略和规则仓位低风险试探")
+            else:
+                score = min(score, 59)
 
         if result.risk_reward_ratio > 0:
             if result.risk_reward_ratio < 1.2:
@@ -982,6 +1350,9 @@ class StockTrendAnalyzer:
         lines = [
             f"=== {result.code} 趋势分析 ===",
             f"",
+            f"📌 品种策略: {result.instrument_type.value} / {result.strategy_profile}",
+            f"   策略说明: {'；'.join(result.strategy_notes) if result.strategy_notes else 'N/A'}",
+            f"",
             f"📊 趋势判断: {result.trend_status.value}",
             f"   均线排列: {result.ma_alignment}",
             f"   趋势强度: {result.trend_strength}/100",
@@ -1002,6 +1373,8 @@ class StockTrendAnalyzer:
             f"相对行业{result.stock_vs_sector:+.2f}pct, "
             f"RS {result.relative_strength_score:+d})",
             f"   K线确认: {result.support_confirmation}",
+            f"   突破形态: {result.breakout_status} "
+            f"(突破分 {result.breakout_score:+d}, 延伸线 {result.breakout_extension_threshold:.2f}%)",
             f"",
             f"📊 量能分析: {result.volume_status.value}",
             f"   量比(vs5日): {result.volume_ratio_5d:.2f}",

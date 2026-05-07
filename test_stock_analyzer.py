@@ -1,6 +1,6 @@
 import pandas as pd
 
-from stock_analyzer import BuySignal, StockTrendAnalyzer, TrendAnalysisResult
+from stock_analyzer import BuySignal, InstrumentType, StockTrendAnalyzer, TrendAnalysisResult
 
 
 def _make_df(closes, highs=None, lows=None, opens=None):
@@ -230,3 +230,40 @@ def test_position_model_caps_position_by_single_trade_risk_budget():
     assert result.single_trade_risk_pct == 10.0
     assert result.max_position_by_risk_pct == 10.0
     assert result.final_position_pct == 10.0
+
+
+def test_instrument_type_uses_etf_strategy_profile():
+    closes = [10.0] * 79 + [10.05]
+
+    result = StockTrendAnalyzer().analyze(
+        _make_df(closes),
+        "512880",
+        security_name="证券ETF",
+    )
+
+    assert result.instrument_type == InstrumentType.SECTOR_ETF
+    assert "行业ETF" in result.strategy_profile
+    assert "行业相对强弱" in result.strategy_notes[0]
+    assert result.to_dict()["instrument_type"] == "行业ETF"
+
+
+def test_platform_breakout_is_scored_as_separate_pattern():
+    closes = [10.0] * 59 + [10.0 + (i % 2) * 0.05 for i in range(20)] + [10.75]
+    highs = [10.2] * 79 + [10.9]
+    lows = [9.8] * 79 + [10.45]
+    opens = [10.0] * 79 + [10.5]
+    df = _make_df(closes, highs=highs, lows=lows, opens=opens)
+    df["volume"] = [1_000_000] * 79 + [2_500_000]
+
+    result = StockTrendAnalyzer().analyze(df, "000001")
+
+    assert result.breakout_valid is True
+    assert result.volume_breakout is True
+    assert result.platform_breakout is True
+    assert result.breakout_score > 0
+    assert result.bias_ma5 > result.adaptive_bias_threshold
+    assert result.bias_ma5 < result.breakout_extension_threshold
+    assert result.signal_score > 59
+    assert result.buy_signal in {BuySignal.BUY, BuySignal.HOLD}
+    assert "突破" in result.pattern_signal
+    assert any("突破" in reason for reason in result.signal_reasons)

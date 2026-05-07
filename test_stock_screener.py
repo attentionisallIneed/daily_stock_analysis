@@ -93,6 +93,8 @@ def test_hot_sector_screener_filters_and_ranks_candidates():
     assert len(result.candidates) == 1
     assert result.selected[0].code == "000001"
     assert result.selected[0].composite_score > 0
+    assert result.selected[0].is_sector_leader is True
+    assert result.selected[0].score_breakdown["sector_leader"] == 5.0
     assert result.selected[0].trend_result.sector_name == "测试行业"
     assert len(result.filtered) == 4
     all_reasons = "；".join("；".join(item["reasons"]) for item in result.filtered)

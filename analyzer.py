@@ -205,6 +205,7 @@ class OpenAIAnalyzer:
 - 乖离率 < 2%：最佳买点区间
 - 乖离率 2% 至规则纪律线：只可小仓介入
 - 乖离率超过规则纪律线：严禁追高！直接判定为"观望"
+- 有效突破/趋势加速必须由规则层标记；只有未超过突破延伸线时，才可按突破策略低仓试探，不能混同为普通追涨
 
 ### 2. 趋势交易（顺势而为）
 - **多头排列必须条件**：MA5 > MA10 > MA20
@@ -228,6 +229,11 @@ class OpenAIAnalyzer:
 - 监管处罚/立案调查
 - 行业政策利空
 - 大额解禁
+
+### 6. 品种差异
+- 普通股票：重点看筹码、公告、财报、减持、个股流动性。
+- 行业 ETF：重点看行业趋势、板块热度、相对强弱和成交活跃度，不把个股财报作为核心依据。
+- 宽基 ETF / 指数：重点看大盘环境、成交额、市场宽度和宏观风险，指数仅用于观察不输出开仓仓位。
 
 ## 输出格式：决策仪表盘 JSON
 
@@ -735,10 +741,19 @@ class OpenAIAnalyzer:
             resistance_levels = trend.get('resistance_levels') or []
             support_text = ', '.join(f"{level:.2f}" for level in support_levels[:3]) if support_levels else '无'
             resistance_text = ', '.join(f"{level:.2f}" for level in resistance_levels[:3]) if resistance_levels else '无'
+            instrument_type = trend.get('instrument_type') or '普通股票'
+            strategy_profile = trend.get('strategy_profile') or '普通股票趋势回踩策略'
+            strategy_notes = '；'.join(trend.get('strategy_notes') or []) or '按普通趋势回踩纪律处理'
+            breakout_extension_threshold = float(trend.get('breakout_extension_threshold') or bias_threshold)
+            breakout_reasons = trend.get('breakout_reasons') or []
+            breakout_risks = trend.get('breakout_risks') or []
+            breakout_detail = '；'.join(breakout_reasons) or trend.get('breakout_status') or '无明确突破'
+            breakout_risk_text = '；'.join(breakout_risks) or '无'
             prompt += f"""
 ### 趋势分析预判（基于交易理念）
 | 指标 | 数值 | 判定 |
 |------|------|------|
+| 品种策略 | {instrument_type} / {strategy_profile} | {strategy_notes} |
 | 趋势状态 | {trend.get('trend_status', '未知')} | |
 | 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
 | 当前价 | {trend.get('current_price', 'N/A')} | |
@@ -759,6 +774,11 @@ class OpenAIAnalyzer:
 | 连续守住MA5/MA10 | {trend.get('ma5_hold_days', 0)}日 / {trend.get('ma10_hold_days', 0)}日 | 连续未跌破关键均线 |
 | 是否跌破MA20 | {ma20_breakdown_text} | 跌破则买入信号失效或降级 |
 | K线支撑结论 | {support_confirmation} | |
+| 形态信号 | {trend.get('pattern_signal', '回踩优先')} | 回踩策略与突破策略分开处理 |
+| 突破结论 | {trend.get('breakout_status', '无明确突破')} | {breakout_detail} |
+| 突破位/突破分 | {trend.get('breakout_level', 0):.2f} / {trend.get('breakout_score', 0):+d} | 有效突破：{trend.get('breakout_valid', False)} |
+| 突破延伸线 | {breakout_extension_threshold:.2f}% | 超过则视为突破后追高 |
+| 突破风险 | {breakout_risk_text} | |
 | 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
 | 规则支撑位 | {support_text} | 优先参考 MA5/MA10/MA20 附近支撑 |
 | 规则压力位 | {resistance_text} | 目标位优先参考近期压力 |
@@ -778,6 +798,7 @@ class OpenAIAnalyzer:
 
 ### 硬规则约束（最终 JSON 必须服从）
 - 若乖离率(MA5) > 自适应追高线（当前{bias_threshold:.2f}%），operation_advice 不得输出“买入/加仓/强烈买入”，必须以“观望”为主。
+- 例外：仅当规则层标记有效突破/趋势加速，且 MA5 乖离未超过突破延伸线（当前{breakout_extension_threshold:.2f}%）时，才可按突破策略低仓试探；超过延伸线仍必须观望。
 - 若趋势状态为空头排列/强势空头，operation_advice 不得输出买入类建议。
 - 若筹码获利比例过高且筹码分散，必须在 risk_warning 和 risk_alerts 中明确提示获利盘兑现风险。
 - 买点、止损、目标位、盈亏比必须使用规则层给出的数值，LLM 只解释来源，不得自行创造点位。
@@ -990,6 +1011,10 @@ class OpenAIAnalyzer:
         ma20_breakdown = bool(trend.get('ma20_breakdown'))
         relative_strength_score = int(float(trend.get('relative_strength_score') or 0))
         relative_strength_status = str(trend.get('relative_strength_status') or '')
+        breakout_valid = bool(trend.get('breakout_valid'))
+        breakout_extension_threshold = float(trend.get('breakout_extension_threshold') or bias_threshold)
+        breakout_status = str(trend.get('breakout_status') or '')
+        instrument_type = str(trend.get('instrument_type') or '普通股票')
         official_risk_flags = list(company_intel.get('risk_flags') or [])
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
@@ -1005,11 +1030,24 @@ class OpenAIAnalyzer:
                 result.sentiment_score = min(result.sentiment_score, 69)
             warnings.append(f"规则盈亏比为{risk_reward_ratio:.2f}，仅适合低仓试探")
         if bias_ma5 > bias_threshold and result.operation_advice in buy_advices:
-            result.operation_advice = '观望'
-            result.trend_prediction = '震荡'
-            result.sentiment_score = min(result.sentiment_score, 59)
-            result.confidence_level = '中'
-            warnings.append(f"乖离率MA5为{bias_ma5:.2f}%，超过{bias_threshold:.2f}%纪律线，禁止追高")
+            if breakout_valid and bias_ma5 <= breakout_extension_threshold:
+                result.sentiment_score = min(result.sentiment_score, 79)
+                if result.confidence_level == '高':
+                    result.confidence_level = '中'
+                warnings.append(
+                    f"乖离率MA5为{bias_ma5:.2f}%，超过{bias_threshold:.2f}%回踩纪律线；"
+                    f"但规则层确认有效突破（{breakout_status}），未超过{breakout_extension_threshold:.2f}%突破延伸线，"
+                    "只能按突破策略和规则仓位试探"
+                )
+            else:
+                result.operation_advice = '观望'
+                result.trend_prediction = '震荡'
+                result.sentiment_score = min(result.sentiment_score, 59)
+                result.confidence_level = '中'
+                warnings.append(
+                    f"乖离率MA5为{bias_ma5:.2f}%，超过{bias_threshold:.2f}%纪律线，"
+                    f"且无有效突破确认或已超过{breakout_extension_threshold:.2f}%突破延伸线，禁止追高"
+                )
 
         if any(status in trend_status for status in ['空头排列', '强势空头']) and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -1094,6 +1132,18 @@ class OpenAIAnalyzer:
                         risk_alerts.append(text)
 
             data_perspective = result.dashboard.setdefault('data_perspective', {})
+            data_perspective['instrument_strategy'] = {
+                'instrument_type': instrument_type,
+                'strategy_profile': str(trend.get('strategy_profile') or ''),
+                'strategy_notes': trend.get('strategy_notes') or [],
+            }
+            data_perspective['pattern_status'] = {
+                'pattern_signal': str(trend.get('pattern_signal') or ''),
+                'breakout_status': breakout_status,
+                'breakout_score': int(float(trend.get('breakout_score') or 0)),
+                'breakout_level': float(trend.get('breakout_level') or 0),
+                'breakout_extension_threshold': breakout_extension_threshold,
+            }
             price_position = data_perspective.setdefault('price_position', {})
             if primary_support is not None:
                 price_position['support_level'] = round(float(primary_support), 2)

@@ -47,6 +47,7 @@ class ScreenedStock:
     change_pct: float = 0.0
     turnover_rate: float = 0.0
     average_amount_5d: float = 0.0
+    is_sector_leader: bool = False
     filter_reasons: List[str] = field(default_factory=list)
     risk_flags: List[str] = field(default_factory=list)
 
@@ -60,12 +61,15 @@ class ScreenedStock:
             "trend_score": self.trend_result.signal_score,
             "buy_signal": self.trend_result.buy_signal.value,
             "trend_status": self.trend_result.trend_status.value,
+            "pattern_signal": self.trend_result.pattern_signal,
+            "breakout_score": self.trend_result.breakout_score,
             "bias_ma5": round(self.trend_result.bias_ma5, 2),
             "volume_ratio_5d": round(self.trend_result.volume_ratio_5d, 2),
             "stock_vs_benchmark": self.trend_result.stock_vs_benchmark,
             "stock_vs_sector": self.trend_result.stock_vs_sector,
             "average_amount_5d": round(self.average_amount_5d, 2),
             "change_pct": self.change_pct,
+            "is_sector_leader": self.is_sector_leader,
             "risk_flags": self.risk_flags,
         }
 
@@ -122,8 +126,8 @@ class ScreeningResult:
                 "",
                 "## 排序结果",
                 "",
-                "| 排名 | 代码 | 名称 | 板块 | 综合分 | 趋势分 | 信号 | MA5乖离 | 量比 | 相对大盘 | 相对行业 | 5日均成交额 |",
-                "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+                "| 排名 | 代码 | 名称 | 板块 | 龙头 | 综合分 | 趋势分 | 信号 | 形态 | MA5乖离 | 量比 | 相对大盘 | 相对行业 | 5日均成交额 |",
+                "| --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
 
@@ -131,7 +135,9 @@ class ScreeningResult:
             trend = candidate.trend_result
             lines.append(
                 f"| {idx} | {candidate.code} | {candidate.name} | {candidate.sector_name} | "
+                f"{'是' if candidate.is_sector_leader else '-'} | "
                 f"{candidate.composite_score:.1f} | {trend.signal_score} | {trend.buy_signal.value} | "
+                f"{trend.pattern_signal}({trend.breakout_score:+d}) | "
                 f"{trend.bias_ma5:+.2f}% | {trend.volume_ratio_5d:.2f} | "
                 f"{trend.stock_vs_benchmark:+.2f}pct | {trend.stock_vs_sector:+.2f}pct | "
                 f"{candidate.average_amount_5d / 100000000:.2f}亿 |"
@@ -298,6 +304,7 @@ class StockScreener:
             benchmark_df=benchmark_df,
             sector_df=sector_df,
             sector_name=sector.name,
+            security_name=name,
         )
 
         filter_reasons = self._filter_by_trend(row, daily_df, trend)
@@ -307,7 +314,8 @@ class StockScreener:
         average_amount_5d = self._average_amount_5d(daily_df, fallback=self._safe_float(row.get("amount")))
         change_pct = self._safe_float(row.get("change_pct"))
         turnover_rate = self._safe_float(row.get("turnover_rate"))
-        breakdown = self._score_candidate(sector, trend, average_amount_5d)
+        is_sector_leader = self._is_sector_leader(row, sector)
+        breakdown = self._score_candidate(sector, trend, average_amount_5d, is_sector_leader)
         composite_score = sum(breakdown.values())
         risk_flags = list(trend.risk_factors)
 
@@ -323,6 +331,7 @@ class StockScreener:
             change_pct=change_pct,
             turnover_rate=turnover_rate,
             average_amount_5d=average_amount_5d,
+            is_sector_leader=is_sector_leader,
             risk_flags=risk_flags,
         )
 
@@ -383,6 +392,7 @@ class StockScreener:
         sector: SectorCandidate,
         trend: TrendAnalysisResult,
         average_amount_5d: float,
+        is_sector_leader: bool = False,
     ) -> Dict[str, float]:
         buy_point_score = self._buy_point_score(trend)
         liquidity_score = self._liquidity_score(average_amount_5d)
@@ -397,14 +407,25 @@ class StockScreener:
             "buy_point": round(buy_point_score, 2),
             "liquidity": round(liquidity_score, 2),
             "relative_strength": round(relative_strength_score, 2),
+            "sector_leader": 5.0 if is_sector_leader else 0.0,
             "risk": round(risk_score, 2),
         }
+
+    def _is_sector_leader(self, row: Dict[str, Any], sector: SectorCandidate) -> bool:
+        leader = str(sector.leading_stock or "").strip()
+        if not leader:
+            return False
+        code = str(row.get("code") or "").strip()
+        name = str(row.get("name") or "").strip()
+        return bool((code and code in leader) or (name and name in leader))
 
     def _buy_point_score(self, trend: TrendAnalysisResult) -> float:
         bias_threshold = trend.adaptive_bias_threshold or StockTrendAnalyzer.BIAS_THRESHOLD
         bias = trend.bias_ma5
         if trend.support_ma5 or trend.support_ma10:
             return 20.0
+        if trend.breakout_valid and trend.bias_ma5 < trend.breakout_extension_threshold:
+            return 16.0
         if -3 <= bias <= 2:
             return 18.0
         if -5 <= bias < -3:

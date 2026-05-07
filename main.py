@@ -393,6 +393,7 @@ class StockAnalysisPipeline:
                             df,
                             code,
                             benchmark_df=benchmark_df,
+                            security_name=stock_name,
                         )
                         logger.info(f"[{code}] 趋势分析: {trend_result.trend_status.value}, "
                                   f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}, "
@@ -528,6 +529,9 @@ class StockAnalysisPipeline:
         # 添加趋势分析结果
         if trend_result:
             enhanced['trend_analysis'] = {
+                'instrument_type': trend_result.instrument_type.value,
+                'strategy_profile': trend_result.strategy_profile,
+                'strategy_notes': trend_result.strategy_notes,
                 'trend_status': trend_result.trend_status.value,
                 'ma_alignment': trend_result.ma_alignment,
                 'trend_strength': trend_result.trend_strength,
@@ -555,6 +559,21 @@ class StockAnalysisPipeline:
                 'support_confirmation': trend_result.support_confirmation,
                 'support_levels': trend_result.support_levels,
                 'resistance_levels': trend_result.resistance_levels,
+                'pattern_signal': trend_result.pattern_signal,
+                'breakout_status': trend_result.breakout_status,
+                'breakout_level': trend_result.breakout_level,
+                'breakout_score': trend_result.breakout_score,
+                'breakout_valid': trend_result.breakout_valid,
+                'breakout_extension_threshold': trend_result.breakout_extension_threshold,
+                'new_high_20d': trend_result.new_high_20d,
+                'volume_breakout': trend_result.volume_breakout,
+                'platform_breakout': trend_result.platform_breakout,
+                'ma_compression_breakout': trend_result.ma_compression_breakout,
+                'limit_up_pullback': trend_result.limit_up_pullback,
+                'breakout_retest_valid': trend_result.breakout_retest_valid,
+                'trend_acceleration': trend_result.trend_acceleration,
+                'breakout_reasons': trend_result.breakout_reasons,
+                'breakout_risks': trend_result.breakout_risks,
                 'volume_status': trend_result.volume_status.value,
                 'volume_trend': trend_result.volume_trend,
                 'atr_20': trend_result.atr_20,

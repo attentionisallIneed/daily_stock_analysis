@@ -54,6 +54,68 @@ def test_hard_rules_do_not_block_safe_bias_below_adaptive_threshold():
     assert "纪律线" not in updated.risk_warning
 
 
+def test_hard_rules_allow_confirmed_breakout_below_extension_line():
+    result = AnalysisResult(
+        code="000001",
+        name="test",
+        sentiment_score=88,
+        trend_prediction="看多",
+        operation_advice="买入",
+        confidence_level="高",
+        dashboard={"core_conclusion": {"position_advice": {}}, "data_perspective": {}},
+    )
+    context = {
+        "trend_analysis": {
+            "bias_ma5": 3.0,
+            "adaptive_bias_threshold": 2.0,
+            "breakout_valid": True,
+            "breakout_extension_threshold": 4.0,
+            "breakout_status": "放量突破20日高点",
+            "trend_status": "多头排列",
+            "risk_reward_ratio": 2.0,
+            "final_position_pct": 20.0,
+        }
+    }
+
+    updated = OpenAIAnalyzer._apply_hard_rules(object.__new__(OpenAIAnalyzer), result, context)
+
+    assert updated.operation_advice == "买入"
+    assert updated.sentiment_score <= 79
+    assert updated.confidence_level == "中"
+    assert "有效突破" in updated.risk_warning
+    assert updated.dashboard["data_perspective"]["pattern_status"]["breakout_extension_threshold"] == 4.0
+
+
+def test_hard_rules_block_breakout_after_extension_line():
+    result = AnalysisResult(
+        code="000001",
+        name="test",
+        sentiment_score=88,
+        trend_prediction="看多",
+        operation_advice="买入",
+        confidence_level="高",
+        dashboard={"core_conclusion": {"position_advice": {}}, "data_perspective": {}},
+    )
+    context = {
+        "trend_analysis": {
+            "bias_ma5": 5.0,
+            "adaptive_bias_threshold": 2.0,
+            "breakout_valid": True,
+            "breakout_extension_threshold": 4.0,
+            "breakout_status": "放量突破20日高点",
+            "trend_status": "多头排列",
+            "risk_reward_ratio": 2.0,
+            "final_position_pct": 20.0,
+        }
+    }
+
+    updated = OpenAIAnalyzer._apply_hard_rules(object.__new__(OpenAIAnalyzer), result, context)
+
+    assert updated.operation_advice == "观望"
+    assert updated.sentiment_score <= 59
+    assert "突破延伸线" in updated.risk_warning
+
+
 def test_hard_rules_block_buy_advice_after_ma20_breakdown():
     result = AnalysisResult(
         code="000001",
