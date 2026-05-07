@@ -298,7 +298,7 @@ class OpenAIAnalyzer:
                 "invalidation_condition": "规则层信号失效条件"
             },
             "position_strategy": {
-                "suggested_position": "建议仓位：X成",
+                "suggested_position": "规则层建议仓位：X%",
                 "entry_plan": "分批建仓策略描述",
                 "risk_control": "风控策略描述"
             },
@@ -746,7 +746,10 @@ class OpenAIAnalyzer:
 | 规则目标位 | {trend.get('take_profit', 'N/A')} | 由规则层计算，LLM不得自行改写 |
 | 规则盈亏比 | {trend.get('risk_reward_ratio', 0):.2f} | <1.2不买，1.2-1.8低仓试探，>=1.8正常仓位 |
 | 失效条件 | {trend.get('invalidation_condition', 'N/A')} | |
-| 仓位提示 | {trend.get('position_note', 'N/A')} | |
+| 规则建议仓位 | {trend.get('final_position_pct', 0):.1f}% | 由规则层按评分×大盘×盈亏比×单票风险预算计算 |
+| 基础/市场/盈亏比乘数 | {trend.get('base_position_pct', 0):.1f}% / {trend.get('market_position_multiplier', 0):.2f} / {trend.get('risk_reward_position_multiplier', 0):.2f} | |
+| 单票风险距离/仓位上限 | {trend.get('single_trade_risk_pct', 0):.2f}% / {trend.get('max_position_by_risk_pct', 0):.1f}% | |
+| 仓位提示 | {trend.get('position_note', 'N/A')} | LLM不得自行放大仓位 |
 | 中期趋势 | {trend.get('ma60_trend', '未知')} | MA60斜率 {trend.get('ma60_slope', 0):+.2f}% |
 
 ### 硬规则约束（最终 JSON 必须服从）
@@ -755,6 +758,7 @@ class OpenAIAnalyzer:
 - 若筹码获利比例过高且筹码分散，必须在 risk_warning 和 risk_alerts 中明确提示获利盘兑现风险。
 - 买点、止损、目标位、盈亏比必须使用规则层给出的数值，LLM 只解释来源，不得自行创造点位。
 - 若规则盈亏比 < 1.2，operation_advice 不得输出买入类建议；1.2-1.8 之间只能低仓试探。
+- 仓位必须使用规则建议仓位；不得自行放大，规则建议仓位为0%时不得输出买入/加仓/强烈买入。
 - 若市场环境为偏弱/极弱，不得输出高置信度买入；极弱环境且个股非强势多头时，优先观望并降低仓位。
 
 #### 系统分析理由
@@ -815,6 +819,7 @@ class OpenAIAnalyzer:
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
 - **具体狙击点位**：使用规则层提供的买入价、止损价、目标价和盈亏比（精确到分），只解释不改写
+- **仓位策略**：使用规则层建议仓位和风控上限，只解释不放大
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
 
 请输出完整的 JSON 格式决策仪表盘。"""
@@ -938,6 +943,10 @@ class OpenAIAnalyzer:
         trend_status = str(trend.get('trend_status') or '')
         market_status = str(market_environment.get('market_status') or '')
         risk_reward_ratio = float(trend.get('risk_reward_ratio') or 0)
+        final_position_pct = float(trend.get('final_position_pct') or 0)
+        position_note = str(trend.get('position_note') or '')
+        single_trade_risk_pct = float(trend.get('single_trade_risk_pct') or 0)
+        max_position_by_risk_pct = float(trend.get('max_position_by_risk_pct') or 0)
 
         if risk_reward_ratio and risk_reward_ratio < 1.2 and result.operation_advice in buy_advices:
             result.operation_advice = '观望'
@@ -964,6 +973,18 @@ class OpenAIAnalyzer:
             result.sentiment_score = min(result.sentiment_score, 39)
             result.confidence_level = '中'
             warnings.append(f"趋势状态为{trend_status}，不允许买入类建议")
+
+        if final_position_pct <= 0 and result.operation_advice in buy_advices:
+            result.operation_advice = '观望'
+            result.trend_prediction = '震荡'
+            result.sentiment_score = min(result.sentiment_score, 59)
+            result.confidence_level = '中'
+            warnings.append("规则仓位模型建议0%，不允许买入类建议")
+        elif 0 < final_position_pct <= 10 and result.operation_advice in buy_advices:
+            if result.confidence_level == '高':
+                result.confidence_level = '中'
+            result.sentiment_score = min(result.sentiment_score, 69)
+            warnings.append(f"规则建议仓位仅{final_position_pct:.1f}%，只能低仓位试探")
 
         if market_status == '极弱':
             if result.operation_advice in buy_advices:
@@ -1015,6 +1036,28 @@ class OpenAIAnalyzer:
             if trend.get('invalidation_condition'):
                 sniper_points['invalidation_condition'] = trend['invalidation_condition']
 
+            position_strategy = battle_plan.setdefault('position_strategy', {})
+            if final_position_pct <= 0:
+                position_strategy['suggested_position'] = '规则层建议仓位：0.0%（不开新仓）'
+                position_strategy['entry_plan'] = '等待评分、市场环境、盈亏比或止损距离改善后再评估'
+            elif final_position_pct <= 10:
+                position_strategy['suggested_position'] = f"规则层建议仓位：{final_position_pct:.1f}%（低仓试探）"
+                position_strategy['entry_plan'] = '仅在规则买点附近分批试探，不追高加仓'
+            else:
+                position_strategy['suggested_position'] = f"规则层建议仓位：{final_position_pct:.1f}%"
+                position_strategy['entry_plan'] = '按规则买点分批执行，未触发买点则等待'
+
+            risk_control_parts = []
+            if trend.get('stop_loss'):
+                risk_control_parts.append(f"止损位使用规则层{float(trend['stop_loss']):.2f}元")
+            if single_trade_risk_pct:
+                risk_control_parts.append(f"单票风险距离{single_trade_risk_pct:.2f}%")
+            if max_position_by_risk_pct:
+                risk_control_parts.append(f"单票风险预算仓位上限{max_position_by_risk_pct:.1f}%")
+            if position_note:
+                risk_control_parts.append(position_note)
+            position_strategy['risk_control'] = '；'.join(risk_control_parts) or '遵守规则层止损和仓位上限'
+
         if warnings:
             result.risk_warning = self._append_warnings(result.risk_warning, warnings)
             if result.dashboard:
@@ -1038,11 +1081,11 @@ class OpenAIAnalyzer:
                 battle_plan = result.dashboard.setdefault('battle_plan', {})
                 position_strategy = battle_plan.setdefault('position_strategy', {})
                 if result.operation_advice == '观望':
-                    position_strategy['suggested_position'] = '空仓或极低仓位观察' if market_status == '极弱' else '空仓或低仓位观察'
+                    position_strategy['suggested_position'] = '规则层建议仓位：0.0%（不开新仓）' if final_position_pct <= 0 else f"规则层建议仓位：{final_position_pct:.1f}%（仅观察，不主动加仓）"
                 elif risk_reward_ratio and risk_reward_ratio < 1.8 and result.operation_advice in buy_advices:
-                    position_strategy['suggested_position'] = '低仓位试探，等待盈亏比改善或支撑确认'
+                    position_strategy['suggested_position'] = f"规则层建议仓位：{final_position_pct:.1f}%（低仓位试探）"
                 elif market_status == '偏弱' and result.operation_advice in buy_advices:
-                    position_strategy['suggested_position'] = '低仓位试探，等待市场确认'
+                    position_strategy['suggested_position'] = f"规则层建议仓位：{final_position_pct:.1f}%（等待市场确认）"
 
         return result
 

@@ -466,16 +466,13 @@ LLM 输出目标是 JSON 决策仪表盘，包含：
 
 更稳健的做法是：规则层计算点位，LLM 只解释点位来源。
 
-### 6.9 仓位管理不足
+### 6.9 仓位管理不足（MVP 已初步缓解）
 
-当前仓位建议主要依赖 LLM 表述，没有明确公式化仓位模型。
+早期仓位建议主要依赖 LLM 表述，缺少明确公式化仓位模型。
 
-缺少：
+MVP 已在规则层加入分数、市场环境、盈亏比和单票风险预算驱动的仓位计算。仍待继续扩展：
 
-- 分数到仓位的映射。
-- 大盘环境对仓位的折扣。
 - 波动率对仓位的折扣。
-- 单票最大亏损约束。
 - 多只股票同时触发信号时的组合风险管理。
 
 ## 7. 优化路线
@@ -596,9 +593,9 @@ stop_loss = entry_price - 1.5 * ATR
 - 个股弱于所属行业：降分。
 - 大盘弱但个股和行业都强：允许低仓试探。
 
-### 7.7 优先级 P1：仓位管理模型
+### 7.7 优先级 P1：仓位管理模型（MVP 已完成）
 
-建议初版公式：
+初版公式：
 
 ```text
 base_position:
@@ -616,17 +613,28 @@ market_multiplier:
 
 risk_reward_multiplier:
 - rr >= 2.0: 1.0
-- 1.5 <= rr < 2.0: 0.7
-- rr < 1.5: 0.0
+- 1.8 <= rr < 2.0: 0.8
+- 1.2 <= rr < 1.8: 0.4
+- rr < 1.2: 0.0
 
-final_position = base_position * market_multiplier * risk_reward_multiplier
+raw_position = base_position * market_multiplier * risk_reward_multiplier
 ```
 
 同时加入单票最大亏损约束：
 
 ```text
-position_size <= account_risk_budget / abs(entry_price - stop_loss)
+single_trade_risk_pct = (entry_price - stop_loss) / entry_price * 100
+max_position_by_risk = account_risk_budget_pct / single_trade_risk_pct * 100
+final_position = min(raw_position, max_position_by_risk, 30%)
 ```
+
+实现状态：
+
+- `StockTrendAnalyzer` 已输出 `base_position_pct`、`market_position_multiplier`、`risk_reward_position_multiplier`、`single_trade_risk_pct`、`max_position_by_risk_pct` 和 `final_position_pct`。
+- 默认按“震荡”环境生成保守仓位；`main.py` 获取真实大盘环境后会用市场状态重算仓位模型。
+- `analyzer.py` 已将规则建议仓位注入提示词，并在硬规则后处理中强制最终仪表盘使用规则层仓位。
+- 当规则建议仓位为 0% 时，LLM 输出的买入类建议会被修正为观望。
+- 已增加 `test_stock_analyzer.py` 覆盖市场环境乘数、极弱市场归零和单票风险预算仓位上限。
 
 ### 7.8 优先级 P1：热门板块驱动选股能力
 
@@ -700,7 +708,7 @@ MVP 范围：
 1. 增加回测模块，先验证当前策略。（MVP 已完成）
 2. 将买点、止损、目标位改为规则层计算。
 3. 加入盈亏比过滤。
-4. 加入明确仓位模型。
+4. 加入明确仓位模型。（MVP 已完成）
 5. 用 ATR / 波动率替代部分固定阈值。
 6. 升级支撑确认逻辑。
 7. 增加相对强弱和行业映射。

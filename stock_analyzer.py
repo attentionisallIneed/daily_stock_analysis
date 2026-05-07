@@ -18,11 +18,10 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 from enum import Enum
 
 import pandas as pd
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +109,12 @@ class TrendAnalysisResult:
     risk_reward_ratio: float = 0.0
     invalidation_condition: str = ""
     position_note: str = ""
+    base_position_pct: float = 0.0
+    market_position_multiplier: float = 0.0
+    risk_reward_position_multiplier: float = 0.0
+    single_trade_risk_pct: float = 0.0
+    max_position_by_risk_pct: float = 0.0
+    final_position_pct: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -147,6 +152,12 @@ class TrendAnalysisResult:
             'risk_reward_ratio': self.risk_reward_ratio,
             'invalidation_condition': self.invalidation_condition,
             'position_note': self.position_note,
+            'base_position_pct': self.base_position_pct,
+            'market_position_multiplier': self.market_position_multiplier,
+            'risk_reward_position_multiplier': self.risk_reward_position_multiplier,
+            'single_trade_risk_pct': self.single_trade_risk_pct,
+            'max_position_by_risk_pct': self.max_position_by_risk_pct,
+            'final_position_pct': self.final_position_pct,
         }
 
 
@@ -166,6 +177,15 @@ class StockTrendAnalyzer:
     VOLUME_SHRINK_RATIO = 0.7   # 缩量判断阈值（当日量/5日均量）
     VOLUME_HEAVY_RATIO = 1.5    # 放量判断阈值
     MA_SUPPORT_TOLERANCE = 0.02  # MA 支撑判断容忍度（2%）
+    ACCOUNT_RISK_BUDGET_PCT = 1.0  # 单票单次交易最大组合亏损预算（%）
+    MAX_POSITION_PCT = 30.0
+    MARKET_POSITION_MULTIPLIERS = {
+        "强势": 1.0,
+        "偏强": 0.8,
+        "震荡": 0.5,
+        "偏弱": 0.3,
+        "极弱": 0.0,
+    }
     
     def __init__(self):
         """初始化分析器"""
@@ -221,8 +241,91 @@ class StockTrendAnalyzer:
 
         # 6. 生成买入信号
         self._generate_signal(result)
+
+        # 7. 默认按中性市场环境生成规则层仓位，主流程可在注入大盘环境后重算
+        self.apply_position_model(result)
         
         return result
+
+    def apply_position_model(
+        self,
+        result: TrendAnalysisResult,
+        market_status: Optional[str] = None,
+        account_risk_budget_pct: Optional[float] = None,
+    ) -> TrendAnalysisResult:
+        """根据系统评分、大盘环境、盈亏比和单票风险预算计算建议仓位。"""
+        market_status = market_status or "震荡"
+        risk_budget = account_risk_budget_pct or self.ACCOUNT_RISK_BUDGET_PCT
+
+        result.base_position_pct = self._score_to_base_position(result.signal_score)
+        result.market_position_multiplier = self.MARKET_POSITION_MULTIPLIERS.get(market_status, 0.5)
+        result.risk_reward_position_multiplier = self._risk_reward_position_multiplier(result.risk_reward_ratio)
+
+        raw_position = (
+            result.base_position_pct
+            * result.market_position_multiplier
+            * result.risk_reward_position_multiplier
+        )
+
+        result.single_trade_risk_pct = 0.0
+        result.max_position_by_risk_pct = 0.0
+        if result.ideal_buy > result.stop_loss > 0:
+            result.single_trade_risk_pct = round((result.ideal_buy - result.stop_loss) / result.ideal_buy * 100, 2)
+            if result.single_trade_risk_pct > 0 and risk_budget > 0:
+                result.max_position_by_risk_pct = round(risk_budget / result.single_trade_risk_pct * 100, 2)
+
+        if raw_position <= 0:
+            result.final_position_pct = 0.0
+        elif result.max_position_by_risk_pct > 0:
+            result.final_position_pct = round(min(raw_position, result.max_position_by_risk_pct, self.MAX_POSITION_PCT), 1)
+        else:
+            result.final_position_pct = 0.0
+
+        result.position_note = self._build_position_note(result, market_status, raw_position)
+        return result
+
+    def _score_to_base_position(self, score: int) -> float:
+        if score >= 85:
+            return 30.0
+        if score >= 75:
+            return 20.0
+        if score >= 65:
+            return 10.0
+        return 0.0
+
+    def _risk_reward_position_multiplier(self, risk_reward_ratio: float) -> float:
+        if risk_reward_ratio >= 2.0:
+            return 1.0
+        if risk_reward_ratio >= 1.8:
+            return 0.8
+        if risk_reward_ratio >= 1.2:
+            return 0.4
+        return 0.0
+
+    def _build_position_note(
+        self,
+        result: TrendAnalysisResult,
+        market_status: str,
+        raw_position: float,
+    ) -> str:
+        if result.base_position_pct <= 0:
+            return "评分未达到开仓阈值，规则仓位为0%"
+        if result.market_position_multiplier <= 0:
+            return f"市场环境{market_status}，规则仓位为0%"
+        if result.risk_reward_position_multiplier <= 0:
+            return "盈亏比不足，规则仓位为0%"
+        if result.max_position_by_risk_pct <= 0:
+            return "缺少有效止损或风险距离，规则仓位为0%"
+
+        cap_text = ""
+        if result.final_position_pct < raw_position:
+            cap_text = f"，受单票风险预算限制（上限{result.max_position_by_risk_pct:.1f}%）"
+
+        return (
+            f"规则建议仓位{result.final_position_pct:.1f}%"
+            f"（基础{result.base_position_pct:.0f}% × 市场{result.market_position_multiplier:.1f}"
+            f" × 盈亏比{result.risk_reward_position_multiplier:.1f}{cap_text}）"
+        )
     
     def _calculate_mas(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算均线"""
@@ -607,6 +710,8 @@ class StockTrendAnalyzer:
             f"   盈亏比: {result.risk_reward_ratio:.2f}",
             f"   失效条件: {result.invalidation_condition or 'N/A'}",
             f"   仓位提示: {result.position_note or 'N/A'}",
+            f"   规则仓位: {result.final_position_pct:.1f}% "
+            f"(单笔风险距离 {result.single_trade_risk_pct:.2f}%, 风险预算上限 {result.max_position_by_risk_pct:.1f}%)",
             f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",

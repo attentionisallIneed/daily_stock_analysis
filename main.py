@@ -395,6 +395,12 @@ class StockAnalysisPipeline:
             
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称、大盘环境）
             market_context = self._get_market_context()
+            if trend_result:
+                market_environment = market_context.get('environment') or {}
+                self.trend_analyzer.apply_position_model(
+                    trend_result,
+                    market_status=market_environment.get('market_status', '震荡'),
+                )
             enhanced_context = self._enhance_context(
                 context,
                 realtime_quote,
@@ -508,6 +514,12 @@ class StockAnalysisPipeline:
                 'risk_reward_ratio': trend_result.risk_reward_ratio,
                 'invalidation_condition': trend_result.invalidation_condition,
                 'position_note': trend_result.position_note,
+                'base_position_pct': trend_result.base_position_pct,
+                'market_position_multiplier': trend_result.market_position_multiplier,
+                'risk_reward_position_multiplier': trend_result.risk_reward_position_multiplier,
+                'single_trade_risk_pct': trend_result.single_trade_risk_pct,
+                'max_position_by_risk_pct': trend_result.max_position_by_risk_pct,
+                'final_position_pct': trend_result.final_position_pct,
             }
         
         return enhanced
