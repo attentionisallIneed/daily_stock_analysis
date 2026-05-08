@@ -124,3 +124,95 @@ def test_market_analyzer_searches_market_news_with_service():
     assert len(service.calls) == 3
     assert all(call[0] == "market" for call in service.calls)
     assert len(news) == 3
+
+
+def test_market_overview_orchestrates_collection_steps(monkeypatch):
+    analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    calls = []
+
+    monkeypatch.setattr(
+        analyzer,
+        "_get_main_indices",
+        lambda: calls.append("indices")
+        or [MarketIndex(code="000001", name="IndexA", current=3100, change_pct=1.0)],
+    )
+
+    def fake_stats(overview):
+        calls.append("stats")
+        overview.up_count = 10
+
+    def fake_sectors(overview):
+        calls.append("sectors")
+        overview.top_sectors = [{"name": "Tech", "change_pct": 3.0}]
+
+    def fake_north_flow(overview):
+        calls.append("north")
+        overview.north_flow = 12.5
+
+    monkeypatch.setattr(analyzer, "_get_market_statistics", fake_stats)
+    monkeypatch.setattr(analyzer, "_get_sector_rankings", fake_sectors)
+    monkeypatch.setattr(analyzer, "_get_north_flow", fake_north_flow)
+
+    overview = analyzer.get_market_overview()
+
+    assert calls == ["indices", "stats", "sectors", "north"]
+    assert overview.indices[0].code == "000001"
+    assert overview.up_count == 10
+    assert overview.top_sectors == [{"name": "Tech", "change_pct": 3.0}]
+    assert overview.north_flow == 12.5
+
+
+def test_market_review_uses_ai_when_available_and_falls_back_on_failure():
+    calls = []
+
+    class AvailableAnalyzer:
+        def is_available(self):
+            return True
+
+        def _call_api_with_retry(self, prompt, generation_config):
+            calls.append((prompt, generation_config))
+            return "AI review"
+
+    analyzer = MarketAnalyzer(search_service=None, analyzer=AvailableAnalyzer())
+    report = analyzer.generate_market_review(
+        _overview(),
+        [
+            SearchResult("Object headline", "Object snippet", "https://example.com", "example.com"),
+            {"title": "Dict headline", "snippet": "Dict snippet"},
+        ],
+    )
+
+    assert report == "AI review"
+    assert "2026-01-01" in calls[0][0]
+    assert "Object headline" in calls[0][0]
+    assert "Dict headline" in calls[0][0]
+    assert calls[0][1]["max_output_tokens"] == 2048
+
+    class FailingAnalyzer(AvailableAnalyzer):
+        def _call_api_with_retry(self, prompt, generation_config):
+            raise RuntimeError("temporary")
+
+    fallback = MarketAnalyzer(search_service=None, analyzer=FailingAnalyzer()).generate_market_review(_overview(), [])
+
+    assert "2026-01-01" in fallback
+    assert "IndexA" in fallback
+
+
+def test_run_daily_review_composes_overview_news_and_report(monkeypatch):
+    analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    calls = []
+    overview = _overview()
+
+    monkeypatch.setattr(analyzer, "get_market_overview", lambda: calls.append("overview") or overview)
+    monkeypatch.setattr(analyzer, "search_market_news", lambda: calls.append("news") or [{"title": "Headline"}])
+    monkeypatch.setattr(
+        analyzer,
+        "generate_market_review",
+        lambda overview_arg, news_arg: calls.append((overview_arg, news_arg)) or "daily review",
+    )
+
+    assert analyzer.run_daily_review() == "daily review"
+    assert calls[0] == "overview"
+    assert calls[1] == "news"
+    assert calls[2][0] is overview
+    assert calls[2][1] == [{"title": "Headline"}]
