@@ -29,6 +29,77 @@ def test_setup_logging_adds_console_and_file_handlers(tmp_path):
             root_logger.addHandler(handler)
 
 
+def test_pipeline_constructor_wires_dependencies_and_search_modes(monkeypatch):
+    calls = []
+    config = SimpleNamespace(
+        max_workers=7,
+        tavily_api_keys=["tavily-key"],
+        serpapi_keys=["serp-key"],
+    )
+    db = object()
+    fetcher_manager = object()
+    akshare_fetcher = object()
+    trend_analyzer = object()
+    analyzer = object()
+    notifier = object()
+    search_availability = [True, False]
+    user_modes = [True, False]
+
+    monkeypatch.setattr(main_module, "get_config", lambda: config)
+    monkeypatch.setattr(main_module, "get_db", lambda: calls.append("db") or db)
+    monkeypatch.setattr(
+        main_module,
+        "DataFetcherManager",
+        lambda: calls.append("fetcher-manager") or fetcher_manager,
+    )
+    monkeypatch.setattr(main_module, "AkshareFetcher", lambda: calls.append("akshare") or akshare_fetcher)
+    monkeypatch.setattr(main_module, "StockTrendAnalyzer", lambda: calls.append("trend") or trend_analyzer)
+    monkeypatch.setattr(main_module, "OpenAIAnalyzer", lambda: calls.append("analyzer") or analyzer)
+    monkeypatch.setattr(main_module, "NotificationService", lambda: calls.append("notifier") or notifier)
+    monkeypatch.setattr(
+        main_module,
+        "CompanyIntelligenceService",
+        lambda fetcher: calls.append(("company-intel", fetcher)) or SimpleNamespace(fetcher=fetcher),
+    )
+
+    def fake_search_service(tavily_keys=None, serpapi_keys=None):
+        calls.append(("search", tavily_keys, serpapi_keys))
+        return SimpleNamespace(is_available=search_availability.pop(0))
+
+    class FakeUserManager:
+        def __init__(self):
+            self.users = [SimpleNamespace(name="Ann")] if user_modes.pop(0) else []
+
+        def has_users(self):
+            return bool(self.users)
+
+    monkeypatch.setattr(main_module, "SearchService", fake_search_service)
+    monkeypatch.setattr(main_module, "UserManager", FakeUserManager)
+
+    first = main_module.StockAnalysisPipeline()
+    second = main_module.StockAnalysisPipeline(config=config, max_workers=3)
+
+    assert first.config is config
+    assert first.max_workers == 7
+    assert first.db is db
+    assert first.fetcher_manager is fetcher_manager
+    assert first.akshare_fetcher is akshare_fetcher
+    assert first.trend_analyzer is trend_analyzer
+    if hasattr(first, "analyzer"):
+        assert first.analyzer is analyzer
+    assert first.notifier is notifier
+    assert first.company_intel_service.fetcher is akshare_fetcher
+    assert first._market_context is None
+    assert first._benchmark_history is None
+    assert first._benchmark_history_loaded is False
+    assert first.search_service.is_available is True
+    assert len(first.user_manager.users) == 1
+    assert second.max_workers == 3
+    assert second.search_service.is_available is False
+    assert ("search", ["tavily-key"], ["serp-key"]) in calls
+    assert ("company-intel", akshare_fetcher) in calls
+
+
 def test_pipeline_fetch_and_save_uses_cache_and_persists_new_data():
     pipeline = object.__new__(main_module.StockAnalysisPipeline)
 
@@ -62,6 +133,28 @@ def test_pipeline_fetch_and_save_uses_cache_and_persists_new_data():
     assert pipeline.fetch_and_save_stock_data("000001") == (True, None)
     assert pipeline.fetcher_manager.calls == [("000001", 250)]
     assert pipeline.db.saved[0][1:] == ("000001", "fake")
+
+
+def test_pipeline_fetch_and_save_handles_empty_data_and_exceptions():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    pipeline.db = SimpleNamespace(
+        has_today_data=lambda code, today=None: False,
+        save_daily_data=lambda df, code, source: len(df),
+    )
+
+    pipeline.fetcher_manager = SimpleNamespace(
+        get_daily_data=lambda code, days=250: (main_module.pd.DataFrame(), "empty")
+    )
+    ok, error = pipeline.fetch_and_save_stock_data("000001")
+    assert ok is False
+    assert error
+
+    pipeline.fetcher_manager = SimpleNamespace(
+        get_daily_data=lambda code, days=250: (_ for _ in ()).throw(RuntimeError("fetch failed"))
+    )
+    ok, error = pipeline.fetch_and_save_stock_data("000001")
+    assert ok is False
+    assert "fetch failed" in error
 
 
 def test_pipeline_enhances_context_with_market_realtime_chip_and_company_data():
@@ -377,6 +470,67 @@ def test_pipeline_analyze_stock_happy_path_uses_realtime_trend_search_and_ai():
     assert no_context.analyze_stock("000404") is None
 
 
+def test_pipeline_analyze_stock_uses_name_fallbacks_and_tolerates_optional_failures():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    calls = []
+    result = SimpleNamespace(code="999999", sentiment_score=70)
+    company = SimpleNamespace(announcements=[], risk_flags=[])
+    analysis_context = {"raw_data": []}
+
+    class FakeAkshare:
+        def get_realtime_quote(self, code):
+            calls.append(("realtime", code))
+            raise RuntimeError("quote unavailable")
+
+        def get_stock_name(self, code):
+            calls.append(("stock-name", code))
+            return ""
+
+        def get_chip_distribution(self, code):
+            calls.append(("chip", code))
+            raise RuntimeError("chip unavailable")
+
+    pipeline.akshare_fetcher = FakeAkshare()
+    pipeline.company_intel_service = SimpleNamespace(
+        get_company_intelligence=lambda code, name: calls.append(("company", code, name)) or company
+    )
+    pipeline.db = SimpleNamespace(
+        get_analysis_context=lambda code: calls.append(("context", code)) or analysis_context
+    )
+    pipeline.search_service = SimpleNamespace(
+        is_available=True,
+        search_comprehensive_intel=lambda stock_code, stock_name, max_searches=3: calls.append(
+            ("search", stock_code, stock_name, max_searches)
+        )
+        or {},
+    )
+    pipeline._get_market_context = lambda: calls.append("market-context") or {"environment": {}}
+    pipeline._enhance_context = (
+        lambda context, realtime, chip, company_intel, trend_result, stock_name, market_context:
+        calls.append(("enhance", stock_name, realtime, chip, company_intel is company, trend_result, market_context))
+        or {"stock_name": stock_name}
+    )
+    pipeline.analyzer = SimpleNamespace(
+        analyze=lambda enhanced_context, news_context=None: calls.append(("ai", enhanced_context, news_context)) or result
+    )
+
+    assert pipeline.analyze_stock("999999") is result
+    assert ("realtime", "999999") in calls
+    assert ("stock-name", "999999") in calls
+    assert ("chip", "999999") in calls
+    assert any(call[0] == "company" and call[1] == "999999" and "999999" in call[2] for call in calls)
+    assert any(call[0] == "search" and call[1] == "999999" and "999999" in call[2] for call in calls)
+    enhance_call = next(call for call in calls if call[0] == "enhance")
+    assert "999999" in enhance_call[1]
+    assert enhance_call[2] is None
+    assert enhance_call[3] is None
+    assert enhance_call[4] is True
+    assert enhance_call[5] is None
+    ai_call = next(call for call in calls if call[0] == "ai")
+    assert ai_call[1]["stock_name"] == enhance_call[1]
+    assert ai_call[2] is None
+
+
 def test_pipeline_send_notifications_routes_channels_and_user_reports():
     pipeline = object.__new__(main_module.StockAnalysisPipeline)
     calls = []
@@ -454,6 +608,59 @@ def test_pipeline_send_notifications_routes_channels_and_user_reports():
         is_available=lambda: False,
     )
     unavailable._send_notifications([result_a])
+
+
+def test_pipeline_send_notifications_handles_all_channel_failures():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    calls = []
+    result = SimpleNamespace(code="000001")
+
+    class FakeNotifier:
+        def generate_dashboard_report(self, results):
+            calls.append(("dashboard", [item.code for item in results]))
+            return "report"
+
+        def save_report_to_file(self, report):
+            calls.append(("save", report))
+            return "saved.md"
+
+        def is_available(self):
+            return True
+
+        def get_available_channels(self):
+            return [
+                main_module.NotificationChannel.FEISHU,
+                main_module.NotificationChannel.TELEGRAM,
+                main_module.NotificationChannel.EMAIL,
+                main_module.NotificationChannel.CUSTOM,
+            ]
+
+        def send_to_feishu(self, report):
+            calls.append(("feishu", report))
+            return False
+
+        def send_to_telegram(self, report):
+            calls.append(("telegram", report))
+            return False
+
+        def send_to_email(self, report, receivers=None):
+            calls.append(("email", report, receivers))
+            return False
+
+        def send_to_custom(self, report):
+            calls.append(("custom", report))
+            return False
+
+    pipeline.notifier = FakeNotifier()
+    pipeline.config = SimpleNamespace(email_receivers=[])
+    pipeline.user_manager = SimpleNamespace(has_users=lambda: False)
+
+    pipeline._send_notifications([result])
+
+    assert ("feishu", "report") in calls
+    assert ("telegram", "report") in calls
+    assert ("email", "report", None) in calls
+    assert ("custom", "report") in calls
 
 
 def test_pipeline_hot_sector_screening_runs_details_and_sends_report(monkeypatch):
@@ -600,6 +807,14 @@ def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
     monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
     assert main_module.main() == 130
 
+    monkeypatch.setattr(
+        main_module,
+        "run_full_analysis",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fatal")),
+    )
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
+    assert main_module.main() == 1
+
 
 def test_run_market_review_saves_and_sends_report(monkeypatch):
     class FakeMarketAnalyzer:
@@ -729,3 +944,42 @@ def test_run_full_analysis_delegates_pipeline_market_review_and_feishu(monkeypat
     assert ("run", ["000001"], False, True) in calls
     assert any(call[0] == "market" for call in calls)
     assert any(call[0] == "feishu" and "market report" in call[2] for call in calls)
+
+
+def test_run_full_analysis_handles_feishu_and_pipeline_exceptions(monkeypatch):
+    calls = []
+
+    class FakePipeline:
+        def __init__(self, config, max_workers=None):
+            self.notifier = SimpleNamespace(generate_dashboard_report=lambda results: "dashboard")
+            self.analyzer = "analyzer"
+            self.search_service = "search"
+
+        def run(self, stock_codes=None, dry_run=False, send_notification=True):
+            return [SimpleNamespace(code="000001", name="Alpha", sentiment_score=80, operation_advice="buy", trend_prediction="up", get_emoji=lambda: "B")]
+
+    class BrokenFeishuDoc:
+        def is_configured(self):
+            return True
+
+        def create_daily_doc(self, title, content):
+            calls.append(("feishu-error", title, content))
+            raise RuntimeError("doc failed")
+
+    monkeypatch.setattr(main_module, "StockAnalysisPipeline", FakePipeline)
+    monkeypatch.setattr(main_module, "run_market_review", lambda **kwargs: "")
+    monkeypatch.setattr(main_module, "FeishuDocManager", lambda: BrokenFeishuDoc())
+
+    config = SimpleNamespace(market_review_enabled=False)
+    args = SimpleNamespace(workers=1, dry_run=False, no_notify=False, no_market_review=False)
+
+    main_module.run_full_analysis(config, args, stock_codes=["000001"])
+    assert calls and calls[0][0] == "feishu-error"
+
+    monkeypatch.setattr(
+        main_module,
+        "StockAnalysisPipeline",
+        lambda config, max_workers=None: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
+    )
+
+    main_module.run_full_analysis(config, args, stock_codes=["000001"])
