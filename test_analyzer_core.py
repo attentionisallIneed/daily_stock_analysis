@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import analyzer as analyzer_module
@@ -45,6 +46,64 @@ def test_analysis_result_dashboard_helpers_and_defaults():
     assert result.get_risk_alerts() == ["risk"]
     assert result.get_emoji()
     assert result.get_confidence_stars()
+
+    fallback = AnalysisResult(
+        code="000002",
+        name="Beta",
+        sentiment_score=50,
+        trend_prediction="flat",
+        operation_advice="hold",
+        analysis_summary="fallback summary",
+    )
+
+    assert fallback.get_core_conclusion() == "fallback summary"
+    assert fallback.get_position_advice() == "hold"
+    assert fallback.get_sniper_points() == {}
+    assert fallback.get_checklist() == []
+    assert fallback.get_risk_alerts() == []
+
+
+def test_openai_analyzer_initializes_client_availability_from_config(monkeypatch):
+    missing_config = SimpleNamespace(openai_api_key="", openai_base_url="", openai_model="")
+    monkeypatch.setattr(analyzer_module, "get_config", lambda: missing_config)
+
+    missing = OpenAIAnalyzer()
+
+    assert missing.is_available() is False
+    assert missing._client is None
+
+    created = []
+    full_config = SimpleNamespace(openai_api_key="key", openai_base_url="https://api.example", openai_model="model")
+    monkeypatch.setattr(analyzer_module, "get_config", lambda: full_config)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=lambda timeout=120: ("client", timeout)))
+
+    available = OpenAIAnalyzer()
+
+    assert available.is_available() is True
+    assert created == [
+        {
+            "api_key": "key",
+            "base_url": "https://api.example",
+            "http_client": ("client", 120),
+        }
+    ]
+
+    class BrokenOpenAI:
+        def __init__(self, **kwargs):
+            raise RuntimeError("client failed")
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=BrokenOpenAI))
+
+    failed = OpenAIAnalyzer()
+
+    assert failed.is_available() is False
+    assert failed._client is None
 
 
 def test_format_prompt_includes_enriched_context_sections():
@@ -197,6 +256,13 @@ def test_analyze_returns_default_when_unavailable_and_success_when_mocked(monkey
     assert parsed.search_performed is True
     assert calls[0][0] == "prompt"
 
+    available._call_api_with_retry = lambda prompt, generation_config: (_ for _ in ()).throw(RuntimeError("api failed"))
+    failed = available.analyze({"code": "000003", "stock_name": "Gamma"})
+
+    assert failed.success is False
+    assert failed.code == "000003"
+    assert "api failed" in failed.error_message
+
 
 def test_call_api_with_retry_uses_client_and_retry_delay(monkeypatch):
     analyzer = _analyzer()
@@ -221,6 +287,36 @@ def test_call_api_with_retry_uses_client_and_retry_delay(monkeypatch):
     assert sleeps == [0.5]
     assert attempts[1]["model"] == "model"
     assert attempts[1]["messages"][1]["content"] == "prompt"
+
+
+def test_call_api_with_retry_handles_missing_client_empty_response_and_exhaustion(monkeypatch):
+    analyzer = _analyzer()
+    config = SimpleNamespace(llm_max_retries=1, llm_retry_delay=0.1)
+    monkeypatch.setattr(analyzer_module, "get_config", lambda: config)
+
+    try:
+        analyzer._call_api_with_retry("prompt", {})
+        assert False
+    except RuntimeError as exc:
+        assert "OpenAI" in str(exc)
+
+    class EmptyCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""))])
+
+    analyzer._client = SimpleNamespace(chat=SimpleNamespace(completions=EmptyCompletions()))
+    try:
+        analyzer._call_api_with_retry("prompt", {})
+        assert False
+    except ValueError:
+        pass
+
+    config.llm_max_retries = 0
+    try:
+        analyzer._call_api_with_retry("prompt", {})
+        assert False
+    except Exception as exc:
+        assert "API" in str(exc)
 
 
 def test_format_helpers_and_batch_analyze(monkeypatch):
