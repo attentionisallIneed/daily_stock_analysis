@@ -240,3 +240,165 @@ def test_builder_helpers_and_daily_report_shortcut(monkeypatch, tmp_path):
     assert notification.send_daily_report([_result()]) is True
     assert saved == ["daily report"]
     assert sent == ["daily report"]
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, text="response"):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def test_wechat_sender_uses_single_chunked_and_response_paths(monkeypatch):
+    service = _service(_wechat_url="https://wechat.example/hook", _wechat_max_bytes=20)
+    chunks = []
+    monkeypatch.setattr(service, "_send_wechat_message", lambda content: chunks.append(content) or True)
+
+    assert _service().send_to_wechat("content") is False
+    assert service.send_to_wechat("short") is True
+    assert service.send_to_wechat("alpha\n---\n" + "b" * 80) is True
+    assert service._send_wechat_force_chunked("line-one-is-long\nline-two-is-long", max_bytes=110) is True
+    assert len(chunks) >= 3
+
+    posts = []
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        posts.append((url, json, timeout))
+        return FakeResponse(payload={"errcode": 0})
+
+    real_sender = _service(_wechat_url="https://wechat.example/hook")
+    monkeypatch.setattr(notification.requests, "post", fake_post)
+
+    assert real_sender._send_wechat_message("hello") is True
+    assert posts[0][1]["markdown"]["content"] == "hello"
+
+    monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: FakeResponse(payload={"errcode": 1}))
+    assert real_sender._send_wechat_message("hello") is False
+
+    monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: FakeResponse(status_code=500))
+    assert real_sender._send_wechat_message("hello") is False
+
+
+def test_feishu_sender_uses_single_chunked_and_response_paths(monkeypatch):
+    service = _service(_feishu_url="https://feishu.example/hook", _feishu_max_bytes=20)
+    chunks = []
+    monkeypatch.setattr(service, "_send_feishu_message", lambda content: chunks.append(content) or True)
+
+    assert _service().send_to_feishu("content") is False
+    assert service.send_to_feishu("short") is True
+    assert service.send_to_feishu("alpha\n---\n" + "b" * 80) is True
+    assert service._send_feishu_force_chunked("line-one-is-long\nline-two-is-long", max_bytes=110) is True
+    assert len(chunks) >= 3
+
+    posts = []
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        posts.append((url, json, timeout))
+        return FakeResponse(payload={"code": 0}, text="ok")
+
+    real_sender = _service(_feishu_url="https://feishu.example/hook")
+    monkeypatch.setattr(notification.requests, "post", fake_post)
+
+    assert real_sender._send_feishu_message("hello") is True
+    assert posts[0][1]["content"]["text"] == "hello"
+
+    monkeypatch.setattr(
+        notification.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(payload={"StatusCode": 1, "StatusMessage": "bad"}, text="bad"),
+    )
+    assert real_sender._send_feishu_message("hello") is False
+
+    monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: FakeResponse(status_code=500, text="bad"))
+    assert real_sender._send_feishu_message("hello") is False
+
+
+def test_telegram_sender_handles_short_long_and_parse_fallback(monkeypatch):
+    service = _service(_telegram_config={"bot_token": "token", "chat_id": "chat"})
+    sent = []
+    monkeypatch.setattr(service, "_send_telegram_message", lambda api_url, chat_id, text: sent.append(text) or True)
+
+    assert _service().send_to_telegram("content") is False
+    assert service.send_to_telegram("short") is True
+    assert service.send_to_telegram(("section\n---\n" * 900) + "tail") is True
+    assert service._send_telegram_chunked("api", "chat", "a\n---\n" + "b" * 20, max_length=15) is True
+    assert sent
+
+    responses = [
+        FakeResponse(payload={"ok": False, "description": "markdown parse failed"}),
+        FakeResponse(payload={"ok": True}),
+    ]
+    posts = []
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        posts.append(dict(json))
+        return responses.pop(0)
+
+    real_sender = _service()
+    monkeypatch.setattr(notification.requests, "post", fake_post)
+
+    assert real_sender._send_telegram_message("api", "chat", "**bad**") is True
+    assert posts[0]["parse_mode"] == "Markdown"
+    assert "parse_mode" not in posts[1]
+
+    monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: FakeResponse(status_code=500, text="bad"))
+    assert real_sender._send_telegram_message("api", "chat", "text") is False
+
+
+def test_custom_webhook_sender_posts_encoded_payloads(monkeypatch):
+    service = _service(
+        _custom_webhook_urls=[
+            "https://hooks.slack.com/services/T",
+            "https://discord.com/api/webhooks/1",
+        ]
+    )
+    calls = []
+
+    def fake_post(url, data=None, headers=None, timeout=None, **kwargs):
+        calls.append((url, data, headers, timeout))
+        status = 200 if len(calls) == 1 else 500
+        return FakeResponse(status_code=status, text="bad")
+
+    monkeypatch.setattr(notification.requests, "post", fake_post)
+
+    assert _service().send_to_custom("content") is False
+    assert service.send_to_custom("content") is True
+    assert calls[0][2]["Content-Type"] == "application/json; charset=utf-8"
+    assert b"content" in calls[0][1]
+
+
+def test_email_sender_uses_ssl_tls_and_receiver_guards(monkeypatch):
+    service = _service(_email_config={"sender": "sender@qq.com", "password": "secret", "receivers": ["to@example.com"]})
+    events = []
+
+    class FakeSMTP:
+        def __init__(self, server, port, timeout):
+            events.append(("connect", server, port, timeout))
+
+        def starttls(self):
+            events.append(("starttls",))
+
+        def login(self, sender, password):
+            events.append(("login", sender, password))
+
+        def send_message(self, message):
+            events.append(("send", message["To"]))
+
+        def quit(self):
+            events.append(("quit",))
+
+    monkeypatch.setattr(notification.smtplib, "SMTP_SSL", FakeSMTP)
+    monkeypatch.setattr(notification.smtplib, "SMTP", FakeSMTP)
+
+    assert _service().send_to_email("content") is False
+    assert _service(_email_config={"sender": "sender@qq.com", "password": "secret", "receivers": []}).send_to_email("content") is False
+    assert service.send_to_email("# Report", subject="Subject") is True
+
+    tls_service = _service(
+        _email_config={"sender": "sender@gmail.com", "password": "secret", "receivers": ["to@example.com"]}
+    )
+    assert tls_service.send_to_email("# Report", subject="Subject") is True
+    assert any(event[0] == "starttls" for event in events)
