@@ -1,7 +1,24 @@
 import os
 
+import pandas as pd
+
+import market_analyzer as market_module
 from market_analyzer import MarketAnalyzer, MarketIndex, MarketOverview, evaluate_market_environment, temporary_no_proxy
 from search_service import SearchResponse, SearchResult
+
+
+COL_CODE = "\u4ee3\u7801"
+COL_PRICE = "\u6700\u65b0\u4ef7"
+COL_CHANGE_AMOUNT = "\u6da8\u8dcc\u989d"
+COL_CHANGE = "\u6da8\u8dcc\u5e45"
+COL_OPEN_TODAY = "\u4eca\u5f00"
+COL_HIGH = "\u6700\u9ad8"
+COL_LOW = "\u6700\u4f4e"
+COL_PREV_CLOSE = "\u6628\u6536"
+COL_VOLUME = "\u6210\u4ea4\u91cf"
+COL_AMOUNT = "\u6210\u4ea4\u989d"
+COL_SECTOR_NAME = "\u677f\u5757\u540d\u79f0"
+COL_TODAY_NET_BUY = "\u4eca\u65e5\u51c0\u4e70\u989d"
 
 
 def _overview(**overrides):
@@ -125,6 +142,14 @@ def test_market_analyzer_searches_market_news_with_service():
     assert all(call[0] == "market" for call in service.calls)
     assert len(news) == 3
 
+    assert MarketAnalyzer(search_service=None, analyzer=None).search_market_news() == []
+
+    class FailingSearchService:
+        def search_stock_news(self, *args, **kwargs):
+            raise RuntimeError("search failed")
+
+    assert MarketAnalyzer(search_service=FailingSearchService(), analyzer=None).search_market_news() == []
+
 
 def test_market_overview_orchestrates_collection_steps(monkeypatch):
     analyzer = MarketAnalyzer(search_service=None, analyzer=None)
@@ -160,6 +185,70 @@ def test_market_overview_orchestrates_collection_steps(monkeypatch):
     assert overview.up_count == 10
     assert overview.top_sectors == [{"name": "Tech", "change_pct": 3.0}]
     assert overview.north_flow == 12.5
+
+
+def test_market_analyzer_collects_market_data_from_mocked_akshare(monkeypatch):
+    calls = []
+
+    def fake_akshare(api_name, fetch_func):
+        calls.append(api_name)
+        if api_name == "ak.stock_zh_index_spot_em":
+            codes = ["000001", "399001", "399006", "000688", "000016", "000300"]
+            return pd.DataFrame(
+                {
+                    COL_CODE: codes,
+                    COL_PRICE: [3000, 10000, 2200, 900, 2500, 3600],
+                    COL_CHANGE_AMOUNT: [10, 20, -5, 1, 3, 8],
+                    COL_CHANGE: [0.5, 1.2, -0.3, 0.1, 0.2, 0.4],
+                    COL_OPEN_TODAY: [2990, 9900, 2210, 899, 2490, 3590],
+                    COL_HIGH: [3010, 10100, 2220, 910, 2510, 3610],
+                    COL_LOW: [2980, 9800, 2180, 890, 2480, 3580],
+                    COL_PREV_CLOSE: [2990, 9980, 2205, 899, 2497, 3592],
+                    COL_VOLUME: [100, 200, 300, 400, 500, 600],
+                    COL_AMOUNT: [1e8, 2e8, 3e8, 4e8, 5e8, 6e8],
+                }
+            )
+        if api_name == "ak.stock_zh_a_spot_em":
+            return pd.DataFrame(
+                {
+                    COL_CHANGE: [10.0, -10.0, 0.0, 2.0],
+                    COL_AMOUNT: [1e8, 2e8, 3e8, 4e8],
+                }
+            )
+        if api_name == "ak.stock_board_industry_name_em":
+            return pd.DataFrame(
+                {
+                    COL_SECTOR_NAME: ["Tech", "Banks", "Energy"],
+                    COL_CHANGE: [3.0, -2.0, 1.0],
+                }
+            )
+        if api_name == "ak.stock_hsgt_north_net_flow_in_em":
+            raise AttributeError("removed")
+        if api_name == "ak.stock_hsgt_fund_flow_summary_em":
+            return pd.DataFrame({COL_TODAY_NET_BUY: [3e8]})
+        raise AssertionError(api_name)
+
+    monkeypatch.setattr(market_module, "_call_akshare_with_retry", fake_akshare)
+
+    analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    overview = MarketOverview(date="2026-01-01")
+    overview.indices = analyzer._get_main_indices()
+    analyzer._get_market_statistics(overview)
+    analyzer._get_sector_rankings(overview)
+    analyzer._get_north_flow(overview)
+
+    assert [index.code for index in overview.indices] == list(MarketAnalyzer.MAIN_INDICES)
+    assert round(overview.indices[0].amplitude, 2) == 1.0
+    assert overview.up_count == 2
+    assert overview.down_count == 1
+    assert overview.flat_count == 1
+    assert overview.limit_up_count == 1
+    assert overview.limit_down_count == 1
+    assert overview.total_amount == 10.0
+    assert overview.top_sectors[0] == {"name": "Tech", "change_pct": 3.0}
+    assert overview.bottom_sectors[0] == {"name": "Banks", "change_pct": -2.0}
+    assert overview.north_flow == 3.0
+    assert "ak.stock_hsgt_fund_flow_summary_em" in calls
 
 
 def test_market_review_uses_ai_when_available_and_falls_back_on_failure():
