@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pandas as pd
@@ -125,6 +126,51 @@ def test_tushare_converts_codes_normalizes_data_and_rate_limits(monkeypatch):
     assert fetcher._minute_start == 162.0
 
 
+def test_tushare_fetch_raw_data_uses_api_and_wraps_errors():
+    fetcher = object.__new__(TushareFetcher)
+    fetcher._check_rate_limit = lambda: None
+    calls = []
+    expected = pd.DataFrame({"trade_date": ["20260101"], "close": [10.0]})
+
+    class FakeApi:
+        def daily(self, **kwargs):
+            calls.append(kwargs)
+            return expected
+
+    fetcher._api = FakeApi()
+
+    actual = fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    assert actual is expected
+    assert calls == [
+        {
+            "ts_code": "600519.SH",
+            "start_date": "20260101",
+            "end_date": "20260131",
+        }
+    ]
+
+    fetcher._api = None
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    class QuotaApi:
+        def daily(self, **kwargs):
+            raise RuntimeError("quota limit reached")
+
+    fetcher._api = QuotaApi()
+    with pytest.raises(RateLimitError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    class BrokenApi:
+        def daily(self, **kwargs):
+            raise RuntimeError("remote failure")
+
+    fetcher._api = BrokenApi()
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+
 def test_baostock_converts_codes_normalizes_data_and_manages_session():
     fetcher = BaostockFetcher()
 
@@ -192,6 +238,111 @@ def test_baostock_session_raises_on_login_failure_and_still_logs_out():
 
     assert "bad login" in str(excinfo.value)
     assert calls == ["login", "logout"]
+
+
+class _FakeBaostockResult:
+    def __init__(self, *, rows=None, error_code="0", error_msg=""):
+        self.rows = rows or []
+        self.error_code = error_code
+        self.error_msg = error_msg
+        self.fields = ["date", "open", "high", "low", "close", "volume", "amount", "pctChg"]
+        self.index = 0
+
+    def next(self):
+        has_row = self.index < len(self.rows)
+        if has_row:
+            self.index += 1
+        return has_row
+
+    def get_row_data(self):
+        return self.rows[self.index - 1]
+
+
+def test_baostock_fetch_raw_data_builds_dataframe_and_handles_result_errors():
+    fetcher = BaostockFetcher()
+    calls = []
+
+    class FakeBaostock:
+        result = _FakeBaostockResult(
+            rows=[
+                ["2026-01-01", "10", "11", "9", "10.5", "100", "1050", "5.0"],
+                ["2026-01-02", "11", "12", "10", "11.0", "200", "2200", "4.8"],
+            ]
+        )
+
+        def login(self):
+            return SimpleNamespace(error_code="0", error_msg="")
+
+        def logout(self):
+            calls.append(("logout",))
+            return SimpleNamespace(error_code="0", error_msg="")
+
+        def query_history_k_data_plus(self, **kwargs):
+            calls.append(kwargs)
+            return self.result
+
+    fake_bs = FakeBaostock()
+    fetcher._bs_module = fake_bs
+
+    df = fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    assert df["close"].tolist() == ["10.5", "11.0"]
+    assert calls[0] == {
+        "code": "sh.600519",
+        "fields": "date,open,high,low,close,volume,amount,pctChg",
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-31",
+        "frequency": "d",
+        "adjustflag": "2",
+    }
+    assert calls[-1] == ("logout",)
+
+    fake_bs.result = _FakeBaostockResult(error_code="1", error_msg="query failed")
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    fake_bs.result = _FakeBaostockResult(rows=[])
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+
+def test_yfinance_fetch_raw_data_imports_downloader_and_wraps_errors(monkeypatch):
+    fetcher = YfinanceFetcher()
+    calls = []
+    expected = pd.DataFrame(
+        {"Open": [10.0], "High": [11.0], "Low": [9.0], "Close": [10.5], "Volume": [100]},
+        index=pd.Index(pd.to_datetime(["2026-01-01"]), name="Date"),
+    )
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+
+    actual = fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    assert actual is expected
+    assert calls == [
+        {
+            "tickers": "600519.SS",
+            "start": "2026-01-01",
+            "end": "2026-01-31",
+            "progress": False,
+            "auto_adjust": True,
+        }
+    ]
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=lambda **kwargs: pd.DataFrame()))
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
+
+    def broken_download(**kwargs):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=broken_download))
+    with pytest.raises(DataFetchError):
+        fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")
 
 
 def test_akshare_helpers_normalize_records_symbols_and_float_values():
