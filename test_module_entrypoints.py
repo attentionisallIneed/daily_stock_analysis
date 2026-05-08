@@ -1,4 +1,5 @@
 import runpy
+import pathlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,3 +53,35 @@ def test_local_demo_entrypoints_run_without_external_services(monkeypatch, capsy
     assert "sqlite" in db_url
     assert "000001" in output
     assert output
+
+
+def test_notification_demo_entrypoint_writes_report_to_tmp_path(monkeypatch, capsys, tmp_path):
+    repo = Path(__file__).resolve().parent
+    for key in [
+        "WECHAT_WEBHOOK_URL",
+        "FEISHU_WEBHOOK_URL",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "EMAIL_SENDER",
+        "EMAIL_PASSWORD",
+        "EMAIL_RECEIVERS",
+        "CUSTOM_WEBHOOK_URLS",
+    ]:
+        monkeypatch.setenv(key, "")
+    config_module.Config.reset_instance()
+
+    original_path = pathlib.Path
+
+    def redirected_path(value="."):
+        if str(value).endswith("notification.py"):
+            return tmp_path / "notification.py"
+        return original_path(value)
+
+    monkeypatch.setattr(pathlib, "Path", redirected_path)
+
+    runpy.run_path(str(repo / "notification.py"), run_name="__main__")
+
+    output = capsys.readouterr().out
+    reports = list((tmp_path / "reports").glob("report_*.md"))
+    assert reports
+    assert "===" in output
