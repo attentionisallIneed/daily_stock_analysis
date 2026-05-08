@@ -7,11 +7,12 @@ import data_provider.akshare_fetcher as akshare_module
 import data_provider.tushare_fetcher as tushare_module
 from data_provider.akshare_fetcher import AkshareFetcher, _is_etf_code
 from data_provider.baostock_fetcher import BaostockFetcher
-from data_provider.base import DataFetchError
+from data_provider.base import DataFetchError, RateLimitError
 from data_provider.tushare_fetcher import TushareFetcher
 from data_provider.yfinance_fetcher import YfinanceFetcher
 
 
+COL_DATE = "\u65e5\u671f"
 COL_CODE = "\u4ee3\u7801"
 COL_NAME = "\u540d\u79f0"
 COL_SECTOR_NAME = "\u677f\u5757\u540d\u79f0"
@@ -243,6 +244,149 @@ def test_akshare_helpers_normalize_records_symbols_and_float_values():
     assert records == [{"a": 1.0, "b": "x"}]
     assert fetcher._dataframe_to_records(None) == []
     assert fetcher._dataframe_to_records(pd.DataFrame()) == []
+
+
+def test_akshare_dataclasses_and_runtime_helpers_cover_thresholds(monkeypatch):
+    quote = akshare_module.RealtimeQuote(
+        code="600519",
+        name="Moutai",
+        price=1800.0,
+        change_pct=1.5,
+        volume_ratio=2.0,
+        turnover_rate=3.0,
+        amplitude=4.0,
+        pe_ratio=30.0,
+        pb_ratio=9.0,
+        total_mv=20000.0,
+        circ_mv=19000.0,
+        change_60d=5.0,
+    )
+    assert quote.to_dict() == {
+        "code": "600519",
+        "name": "Moutai",
+        "price": 1800.0,
+        "change_pct": 1.5,
+        "volume_ratio": 2.0,
+        "turnover_rate": 3.0,
+        "amplitude": 4.0,
+        "pe_ratio": 30.0,
+        "pb_ratio": 9.0,
+        "total_mv": 20000.0,
+        "circ_mv": 19000.0,
+        "change_60d": 5.0,
+    }
+
+    chips = [
+        akshare_module.ChipDistribution(code="a", profit_ratio=0.95, avg_cost=10.0, concentration_90=0.05),
+        akshare_module.ChipDistribution(code="b", profit_ratio=0.75, avg_cost=10.0, concentration_90=0.10),
+        akshare_module.ChipDistribution(code="c", profit_ratio=0.55, avg_cost=10.0, concentration_90=0.20),
+        akshare_module.ChipDistribution(code="d", profit_ratio=0.35, avg_cost=10.0, concentration_90=0.30),
+        akshare_module.ChipDistribution(code="e", profit_ratio=0.10, avg_cost=10.0, concentration_90=0.30),
+    ]
+
+    assert chips[0].to_dict()["profit_ratio"] == 0.95
+    statuses = [
+        chips[0].get_chip_status(13.0),
+        chips[1].get_chip_status(11.0),
+        chips[2].get_chip_status(10.2),
+        chips[3].get_chip_status(8.0),
+        chips[4].get_chip_status(0.0),
+    ]
+
+    assert all(status for status in statuses)
+    assert len(set(statuses)) == 5
+
+    fetcher = AkshareFetcher(sleep_min=2.0, sleep_max=2.0)
+    monkeypatch.setattr(akshare_module.random, "choice", lambda values: values[0])
+    fetcher._set_random_user_agent()
+    monkeypatch.setattr(
+        akshare_module.random,
+        "choice",
+        lambda values: (_ for _ in ()).throw(RuntimeError("no user agent")),
+    )
+    fetcher._set_random_user_agent()
+
+    with fetcher._without_proxy():
+        marker = "inside"
+    assert marker == "inside"
+
+    assert fetcher._fetch_with_retry("fake.api", lambda: "ok") == "ok"
+
+    sleeps = []
+    times = iter([101.0, 104.0])
+    fetcher._last_request_time = 100.0
+    monkeypatch.setattr(akshare_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(akshare_module.time, "sleep", lambda seconds: sleeps.append(("sleep", seconds)))
+    monkeypatch.setattr(fetcher, "random_sleep", lambda minimum, maximum: sleeps.append(("random", minimum, maximum)))
+
+    fetcher._enforce_rate_limit()
+
+    assert sleeps == [("sleep", 1.0), ("random", 2.0, 2.0)]
+    assert fetcher._last_request_time == 104.0
+
+
+def test_akshare_raw_stock_and_etf_fetch_paths_handle_success_empty_and_errors(monkeypatch):
+    fetcher = _quiet_akshare_fetcher()
+    fetcher._fetch_with_retry = lambda api_name, fetch_func: fetch_func()
+    stock_calls = []
+    etf_calls = []
+    stock_df = pd.DataFrame({COL_DATE: ["2026-01-01", "2026-01-02"], "close": [10.0, 11.0]})
+    etf_df = pd.DataFrame({COL_DATE: ["2026-01-01", "2026-01-02"], "close": [1.0, 1.1]})
+
+    def fake_stock_hist(**kwargs):
+        stock_calls.append(kwargs)
+        return stock_df
+
+    def fake_etf_hist(**kwargs):
+        etf_calls.append(kwargs)
+        return etf_df
+
+    monkeypatch.setattr(akshare_module.ak, "stock_zh_a_hist", fake_stock_hist)
+    monkeypatch.setattr(akshare_module.ak, "fund_etf_hist_em", fake_etf_hist)
+
+    assert fetcher._fetch_stock_data("600519", "2026-01-01", "2026-01-31") is stock_df
+    assert fetcher._fetch_etf_data("512400", "2026-01-01", "2026-01-31") is etf_df
+    assert stock_calls == [
+        {
+            "symbol": "600519",
+            "period": "daily",
+            "start_date": "20260101",
+            "end_date": "20260131",
+            "adjust": "qfq",
+        }
+    ]
+    assert etf_calls == [
+        {
+            "symbol": "512400",
+            "period": "daily",
+            "start_date": "20260101",
+            "end_date": "20260131",
+            "adjust": "qfq",
+        }
+    ]
+
+    monkeypatch.setattr(akshare_module.ak, "stock_zh_a_hist", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(akshare_module.ak, "fund_etf_hist_em", lambda **kwargs: pd.DataFrame())
+    assert fetcher._fetch_stock_data("600519", "2026-01-01", "2026-01-31").empty
+    assert fetcher._fetch_etf_data("512400", "2026-01-01", "2026-01-31").empty
+
+    fetcher._fetch_stock_data = lambda stock_code, start_date, end_date: ("stock", stock_code, start_date, end_date)
+    fetcher._fetch_etf_data = lambda stock_code, start_date, end_date: ("etf", stock_code, start_date, end_date)
+    assert fetcher._fetch_raw_data("600519", "2026-01-01", "2026-01-31")[0] == "stock"
+    assert fetcher._fetch_raw_data("512400", "2026-01-01", "2026-01-31")[0] == "etf"
+
+    error_fetcher = _quiet_akshare_fetcher()
+    error_fetcher._fetch_with_retry = lambda api_name, fetch_func: (_ for _ in ()).throw(RuntimeError("rate limit"))
+    with pytest.raises(RateLimitError):
+        error_fetcher._fetch_stock_data("600519", "2026-01-01", "2026-01-31")
+    with pytest.raises(RateLimitError):
+        error_fetcher._fetch_etf_data("512400", "2026-01-01", "2026-01-31")
+
+    error_fetcher._fetch_with_retry = lambda api_name, fetch_func: (_ for _ in ()).throw(RuntimeError("remote failure"))
+    with pytest.raises(DataFetchError):
+        error_fetcher._fetch_stock_data("600519", "2026-01-01", "2026-01-31")
+    with pytest.raises(DataFetchError):
+        error_fetcher._fetch_etf_data("512400", "2026-01-01", "2026-01-31")
 
 
 def test_akshare_hot_sectors_and_constituents_from_mocked_apis():
