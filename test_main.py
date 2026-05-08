@@ -305,6 +305,78 @@ def test_pipeline_process_single_stock_and_run_cover_success_dry_run_and_empty_p
     assert exploding.process_single_stock("000001") is None
 
 
+def test_pipeline_analyze_stock_happy_path_uses_realtime_trend_search_and_ai():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    calls = []
+    result = SimpleNamespace(code="000001", sentiment_score=91)
+
+    class EnumValue:
+        def __init__(self, value):
+            self.value = value
+
+    trend = SimpleNamespace(
+        trend_status=EnumValue("bullish"),
+        buy_signal=EnumValue("buy"),
+        signal_score=88,
+        relative_strength_status="strong",
+    )
+    company = SimpleNamespace(announcements=[1, 2], risk_flags=[1])
+    context = {"raw_data": [{"date": "2026-01-01", "close": 10, "volume": 100}]}
+
+    pipeline.akshare_fetcher = SimpleNamespace(
+        get_realtime_quote=lambda code: RealtimeQuote(code=code, name="Alpha", price=10.0, volume_ratio=1.5, turnover_rate=2.0),
+        get_chip_distribution=lambda code: ChipDistribution(code=code, profit_ratio=0.8, concentration_90=0.1),
+        get_stock_name=lambda code: "Fallback",
+    )
+    pipeline.company_intel_service = SimpleNamespace(
+        get_company_intelligence=lambda code, name: calls.append(("company", code, name)) or company
+    )
+    pipeline.db = SimpleNamespace(get_analysis_context=lambda code: calls.append(("context", code)) or context)
+    pipeline._get_benchmark_history = lambda: calls.append("benchmark") or main_module.pd.DataFrame({"close": [1, 2]})
+    pipeline.trend_analyzer = SimpleNamespace(
+        analyze=lambda df, code, benchmark_df=None, security_name="": calls.append(("trend", code, security_name)) or trend,
+        apply_position_model=lambda trend_result, market_status="": calls.append(("position", market_status)),
+    )
+    pipeline.search_service = SimpleNamespace(
+        is_available=True,
+        search_comprehensive_intel=lambda stock_code, stock_name, max_searches=3: {
+            "latest_news": SimpleNamespace(success=True, results=[1, 2]),
+            "risk_check": SimpleNamespace(success=False, results=[]),
+        },
+        format_intel_report=lambda intel_results, stock_name: calls.append(("format", stock_name, sorted(intel_results))) or "news context",
+    )
+    pipeline._get_market_context = lambda: {"environment": {"market_status": "strong"}}
+    pipeline._enhance_context = (
+        lambda context_arg, realtime, chip, company_intel, trend_result, stock_name, market_context:
+        calls.append(("enhance", realtime.name, chip.profit_ratio, stock_name, market_context["environment"]["market_status"]))
+        or {"enhanced": True}
+    )
+    pipeline.analyzer = SimpleNamespace(
+        analyze=lambda enhanced_context, news_context=None: calls.append(("ai", enhanced_context, news_context)) or result
+    )
+
+    assert pipeline.analyze_stock("000001") is result
+    assert ("company", "000001", "Alpha") in calls
+    assert ("trend", "000001", "Alpha") in calls
+    assert ("position", "strong") in calls
+    assert ("format", "Alpha", ["latest_news", "risk_check"]) in calls
+    assert ("enhance", "Alpha", 0.8, "Alpha", "strong") in calls
+    assert ("ai", {"enhanced": True}, "news context") in calls
+
+    no_context = object.__new__(main_module.StockAnalysisPipeline)
+    no_context.akshare_fetcher = SimpleNamespace(
+        get_realtime_quote=lambda code: None,
+        get_stock_name=lambda code: "",
+        get_chip_distribution=lambda code: None,
+    )
+    no_context.company_intel_service = SimpleNamespace(
+        get_company_intelligence=lambda code, name: (_ for _ in ()).throw(RuntimeError("intel unavailable"))
+    )
+    no_context.db = SimpleNamespace(get_analysis_context=lambda code: None)
+    no_context.search_service = SimpleNamespace(is_available=False)
+    assert no_context.analyze_stock("000404") is None
+
+
 def test_pipeline_send_notifications_routes_channels_and_user_reports():
     pipeline = object.__new__(main_module.StockAnalysisPipeline)
     calls = []
@@ -432,6 +504,101 @@ def test_pipeline_hot_sector_screening_runs_details_and_sends_report(monkeypatch
     assert screening_result.detailed_results == [detail]
     assert ("screen", 4, 2) in calls
     assert ("send", "screen report") in calls
+
+
+def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
+    calls = []
+
+    def make_args(**overrides):
+        values = {
+            "debug": False,
+            "dry_run": False,
+            "stocks": "000001, 600519",
+            "no_notify": False,
+            "workers": 2,
+            "screen_hot_sectors": False,
+            "screen_top_n": 2,
+            "screen_sector_count": 4,
+            "screen_no_llm": False,
+            "market_review": False,
+            "schedule": False,
+            "no_market_review": False,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    config = SimpleNamespace(
+        log_dir="logs",
+        validate=lambda: ["config warning"],
+        schedule_enabled=False,
+        schedule_time="09:30",
+        tavily_api_keys=[],
+        serpapi_keys=[],
+        openai_api_key="",
+        openai_base_url="",
+        openai_model="",
+        market_review_enabled=False,
+        email_receivers=[],
+    )
+
+    monkeypatch.setattr(main_module, "get_config", lambda: config)
+    monkeypatch.setattr(main_module, "setup_logging", lambda debug=False, log_dir="": calls.append(("logging", debug, log_dir)))
+    monkeypatch.setattr(
+        main_module,
+        "run_full_analysis",
+        lambda config_arg, args_arg, stock_codes=None: calls.append(("full", args_arg.schedule, stock_codes)),
+    )
+
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
+    assert main_module.main() == 0
+    assert ("full", False, ["000001", "600519"]) in calls
+
+    class FakePipeline:
+        def __init__(self, config, max_workers=None):
+            calls.append(("pipeline", max_workers))
+
+        def run_hot_sector_screening(self, **kwargs):
+            calls.append(("screen", kwargs))
+
+    monkeypatch.setattr(main_module, "StockAnalysisPipeline", FakePipeline)
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args(screen_hot_sectors=True, dry_run=True, no_notify=True))
+    assert main_module.main() == 0
+    assert ("screen", {"top_n": 2, "sector_count": 4, "run_llm": False, "send_notification": False}) in calls
+
+    config.tavily_api_keys = ["tk"]
+    config.openai_api_key = "key"
+    config.openai_base_url = "https://api.example"
+    config.openai_model = "model"
+    monkeypatch.setattr(main_module, "NotificationService", lambda: calls.append("notifier") or "notifier")
+    monkeypatch.setattr(main_module, "SearchService", lambda tavily_keys=None, serpapi_keys=None: calls.append(("search", tavily_keys, serpapi_keys)) or "search")
+    monkeypatch.setattr(main_module, "OpenAIAnalyzer", lambda: calls.append("analyzer") or "analyzer")
+    monkeypatch.setattr(
+        main_module,
+        "run_market_review",
+        lambda notifier, analyzer, search_service, send_notification=True: calls.append(
+            ("market", notifier, analyzer, search_service, send_notification)
+        ),
+    )
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args(market_review=True, no_notify=True))
+    assert main_module.main() == 0
+    assert ("market", "notifier", "analyzer", "search", False) in calls
+
+    monkeypatch.setattr(
+        "scheduler.run_with_schedule",
+        lambda task, schedule_time, run_immediately=True: calls.append(("schedule", schedule_time, run_immediately)) or task(),
+    )
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args(schedule=True))
+    assert main_module.main() == 0
+    assert ("schedule", "09:30", True) in calls
+    assert ("full", True, ["000001", "600519"]) in calls
+
+    monkeypatch.setattr(
+        main_module,
+        "run_full_analysis",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
+    assert main_module.main() == 130
 
 
 def test_run_market_review_saves_and_sends_report(monkeypatch):
