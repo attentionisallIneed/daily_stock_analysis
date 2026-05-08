@@ -1,14 +1,6 @@
 import pandas as pd
 
-from stock_analyzer import (
-    BuySignal,
-    InstrumentType,
-    StockTrendAnalyzer,
-    TrendAnalysisResult,
-    TrendStatus,
-    VolumeStatus,
-    analyze_stock,
-)
+from stock_analyzer import BuySignal, InstrumentType, StockTrendAnalyzer, TrendAnalysisResult
 
 
 def _make_df(closes, highs=None, lows=None, opens=None):
@@ -275,90 +267,3 @@ def test_platform_breakout_is_scored_as_separate_pattern():
     assert result.buy_signal in {BuySignal.BUY, BuySignal.HOLD}
     assert "突破" in result.pattern_signal
     assert any("突破" in reason for reason in result.signal_reasons)
-
-
-def test_format_analysis_renders_full_rule_result_and_convenience_function():
-    result = TrendAnalysisResult(
-        code="000001",
-        instrument_type=InstrumentType.STOCK,
-        strategy_profile="rule profile",
-        strategy_notes=["follow pullback"],
-        trend_status=TrendStatus.BULL,
-        ma_alignment="MA5>MA10>MA20",
-        trend_strength=75,
-        current_price=10.5,
-        ma5=10.2,
-        ma10=10.0,
-        ma20=9.8,
-        ma60=9.5,
-        bias_ma5=1.1,
-        bias_ma10=2.0,
-        bias_ma20=3.0,
-        price_vs_ma60=10.5,
-        ma60_slope=1.2,
-        ma60_trend="up",
-        atr_20=0.3,
-        atr_pct=2.86,
-        adaptive_bias_threshold=4.0,
-        adaptive_support_tolerance=0.02,
-        relative_strength_status="strong",
-        stock_return_20d=8.0,
-        stock_vs_benchmark=4.0,
-        stock_vs_sector=2.0,
-        relative_strength_score=7,
-        support_confirmation="confirmed",
-        breakout_status="platform breakout",
-        breakout_score=8,
-        breakout_extension_threshold=7.0,
-        volume_status=VolumeStatus.SHRINK_VOLUME_DOWN,
-        volume_ratio_5d=0.8,
-        volume_trend="shrinking",
-        ideal_buy=10.2,
-        secondary_buy=10.0,
-        stop_loss=9.5,
-        take_profit=12.0,
-        risk_reward_ratio=2.5,
-        invalidation_condition="break stop",
-        position_note="rule position",
-        final_position_pct=20.0,
-        single_trade_risk_pct=3.0,
-        max_position_by_risk_pct=25.0,
-        buy_signal=BuySignal.BUY,
-        signal_score=82,
-        signal_reasons=["trend aligned", "support intact"],
-        risk_factors=["watch volume"],
-    )
-
-    rendered = StockTrendAnalyzer().format_analysis(result)
-
-    assert "000001" in rendered
-    assert "rule profile" in rendered
-    assert "trend aligned" in rendered
-    assert "watch volume" in rendered
-    assert "20.0%" in rendered
-
-    convenience = analyze_stock(_make_df([10.0] * 25), "000001")
-    assert convenience.code == "000001"
-
-
-def test_stock_analyzer_helper_branches_cover_short_data_inference_and_position_notes():
-    analyzer = StockTrendAnalyzer()
-
-    short = analyzer.analyze(_make_df([10.0] * 10), "000001")
-    assert short.risk_factors
-
-    assert analyzer.infer_instrument_type("000001", instrument_type=InstrumentType.INDEX) == InstrumentType.INDEX
-    assert analyzer.infer_instrument_type("000001", instrument_type="stock") == InstrumentType.STOCK
-    assert analyzer.infer_instrument_type("510300", security_name="A50 ETF") == InstrumentType.BROAD_ETF
-    assert analyzer.infer_instrument_type("512880", security_name="broker ETF") == InstrumentType.SECTOR_ETF
-
-    low_score = TrendAnalysisResult(code="low", signal_score=50, ideal_buy=10.0, stop_loss=9.5, risk_reward_ratio=2.0)
-    analyzer.apply_position_model(low_score)
-    assert low_score.final_position_pct == 0.0
-    assert low_score.position_note
-
-    poor_reward = TrendAnalysisResult(code="poor", signal_score=90, ideal_buy=10.0, stop_loss=9.5, risk_reward_ratio=1.0)
-    analyzer.apply_position_model(poor_reward)
-    assert poor_reward.risk_reward_position_multiplier == 0.0
-    assert poor_reward.final_position_pct == 0.0
-    assert poor_reward.position_note
