@@ -99,7 +99,8 @@ def test_akshare_realtime_and_chip_failure_fallbacks():
     akshare_module._realtime_cache.update({"data": None, "timestamp": 0, "ttl": 60})
     akshare_module._etf_realtime_cache.update({"data": None, "timestamp": 0, "ttl": 60})
 
-    bad_number = object()
+    bad_number = pd.NA
+    invalid_number = "not-a-number"
 
     def stock_fetch(api_name, fetch_func):
         assert api_name == "ak.stock_zh_a_spot_em"
@@ -108,7 +109,7 @@ def test_akshare_realtime_and_chip_failure_fallbacks():
                 COL_CODE: ["600519"],
                 COL_NAME: ["Moutai"],
                 COL_PRICE: [bad_number],
-                COL_CHANGE: [bad_number],
+                COL_CHANGE: [invalid_number],
                 COL_CHANGE_AMOUNT: [bad_number],
                 COL_VOLUME_RATIO: [bad_number],
                 COL_TURNOVER: [bad_number],
@@ -139,7 +140,7 @@ def test_akshare_realtime_and_chip_failure_fallbacks():
                 COL_CODE: ["512880"],
                 COL_NAME: ["ETF"],
                 COL_PRICE: [bad_number],
-                COL_CHANGE: [bad_number],
+                COL_CHANGE: [invalid_number],
                 COL_CHANGE_AMOUNT: [bad_number],
                 COL_VOLUME_RATIO: [bad_number],
                 COL_TURNOVER: [bad_number],
@@ -167,7 +168,7 @@ def test_akshare_realtime_and_chip_failure_fallbacks():
             {
                 COL_CHIP_DATE: ["2026-01-02"],
                 COL_PROFIT_RATIO: [bad_number],
-                COL_AVG_COST: [bad_number],
+                COL_AVG_COST: [invalid_number],
                 COL_COST_90_LOW: [bad_number],
                 COL_COST_90_HIGH: [bad_number],
                 COL_CONCENTRATION_90: [bad_number],
