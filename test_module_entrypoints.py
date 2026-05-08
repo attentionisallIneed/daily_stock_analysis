@@ -1,5 +1,8 @@
-import runpy
 import pathlib
+import runpy
+import sys
+import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,3 +147,60 @@ def test_market_analyzer_demo_entrypoint_uses_mocked_akshare(monkeypatch, capsys
     output = capsys.readouterr().out
     assert "3000.00" in output
     assert "Tech" in output
+
+
+def test_provider_demo_entrypoints_use_mocked_external_apis(monkeypatch, capsys):
+    col_date = "\u65e5\u671f"
+    col_code = "\u4ee3\u7801"
+    col_name = "\u540d\u79f0"
+    col_price = "\u6700\u65b0\u4ef7"
+    col_change = "\u6da8\u8dcc\u5e45"
+    col_change_amount = "\u6da8\u8dcc\u989d"
+    col_turnover = "\u6362\u624b\u7387"
+    col_amplitude = "\u632f\u5e45"
+
+    daily_df = pd.DataFrame(
+        {
+            col_date: ["2026-01-01", "2026-01-02"],
+            "open": [10.0, 11.0],
+            "high": [11.0, 12.0],
+            "low": [9.5, 10.5],
+            "close": [10.0, 11.0],
+            "volume": [100, 200],
+            "amount": [1000.0, 2200.0],
+            "pct_chg": [0.0, 10.0],
+        }
+    )
+    etf_quote_df = pd.DataFrame(
+        {
+            col_code: ["512880"],
+            col_name: ["ETF"],
+            col_price: [1.23],
+            col_change: [0.5],
+            col_change_amount: [0.01],
+            col_turnover: [8.8],
+            col_amplitude: [1.1],
+        }
+    )
+    yfinance_df = pd.DataFrame(
+        {"Open": [10.0], "High": [11.0], "Low": [9.5], "Close": [10.5], "Volume": [100]},
+        index=pd.Index(pd.to_datetime(["2026-01-01"]), name="Date"),
+    )
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(ak, "stock_zh_a_hist", lambda **kwargs: daily_df)
+    monkeypatch.setattr(ak, "fund_etf_hist_em", lambda **kwargs: daily_df)
+    monkeypatch.setattr(ak, "fund_etf_spot_em", lambda: etf_quote_df)
+    monkeypatch.setenv("TUSHARE_TOKEN", "")
+    config_module.Config.reset_instance()
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=lambda **kwargs: yfinance_df))
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*found in sys.modules.*", category=RuntimeWarning)
+        runpy.run_module("data_provider.akshare_fetcher", run_name="__main__")
+        runpy.run_module("data_provider.tushare_fetcher", run_name="__main__")
+        runpy.run_module("data_provider.yfinance_fetcher", run_name="__main__")
+
+    output = capsys.readouterr().out
+    assert "512880" in output or "ETF" in output
+    assert output
