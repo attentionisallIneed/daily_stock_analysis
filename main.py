@@ -81,6 +81,8 @@ from search_service import SearchService, SearchResponse
 from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from stock_screener import ScreeningResult, StockScreener
 from market_analyzer import MarketAnalyzer, evaluate_market_environment
+from theme_backtester import ThemeBacktester
+from theme_radar import ThemeRadar
 from user_manager import UserManager
 
 # 配置日志格式
@@ -904,6 +906,68 @@ class StockAnalysisPipeline:
         )
         return screening_result
 
+    def run_theme_radar(
+        self,
+        theme_count: int = 5,
+        leader_top_n: int = 3,
+        lookback_days: int = 7,
+        include_detail_analysis: bool = True,
+        include_concepts: bool = True,
+        send_notification: bool = True,
+    ):
+        """运行热点主题 LLM 雷达，并可选复用 Top 个股精细分析链路。"""
+        logger.info(
+            f"===== 开始热点主题雷达：主题数={theme_count}, Top N={leader_top_n}, "
+            f"回看={lookback_days}日, 精细分析={'启用' if include_detail_analysis else '关闭'} ====="
+        )
+        radar = ThemeRadar(
+            market_analyzer=MarketAnalyzer(search_service=self.search_service, analyzer=self.analyzer),
+            search_service=self.search_service,
+            sector_fetcher=self.akshare_fetcher,
+            daily_fetcher=self.fetcher_manager,
+            trend_analyzer=self.trend_analyzer,
+            analyzer=self.analyzer,
+            detail_analyzer=lambda code: self.process_single_stock(code, skip_analysis=False),
+        )
+        result = radar.run(
+            theme_count=theme_count,
+            leader_top_n=leader_top_n,
+            lookback_days=lookback_days,
+            include_detail_analysis=include_detail_analysis,
+            include_concepts=include_concepts,
+            save_history=True,
+        )
+
+        report = result.report_markdown or radar.format_report(result)
+        date_str = datetime.now().strftime('%Y%m%d')
+        filepath = self.notifier.save_report_to_file(report, f"theme_radar_{date_str}.md")
+        logger.info(f"热点主题雷达报告已保存: {filepath}")
+
+        if send_notification and self.notifier.is_available():
+            success = self.notifier.send(report)
+            if success:
+                logger.info("热点主题雷达报告推送成功")
+            else:
+                logger.warning("热点主题雷达报告推送失败")
+
+        logger.info(
+            f"热点主题雷达完成：主题 {len(result.themes)}，候选龙头 {len(result.selected_stocks)}，"
+            f"历史文件 {result.history_path or '未保存'}"
+        )
+        return result
+
+    def run_theme_backtest(self, history_path: str = "data/theme_radar", send_notification: bool = False):
+        """运行主题/龙头最小回测并保存 Markdown 报告。"""
+        backtester = ThemeBacktester()
+        result = backtester.run_backtest(history_path)
+        report = backtester.format_report(result)
+        date_str = datetime.now().strftime('%Y%m%d')
+        filepath = self.notifier.save_report_to_file(report, f"theme_backtest_{date_str}.md")
+        logger.info(f"热点主题回测报告已保存: {filepath}")
+        if send_notification and self.notifier.is_available():
+            self.notifier.send(report)
+        return result
+
 
 def parse_arguments() -> argparse.Namespace:
     """解析命令行参数"""
@@ -920,6 +984,8 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
   python main.py --screen-hot-sectors --screen-no-llm  # 热门板块规则选股
+  python main.py --theme-radar --theme-no-llm-detail   # 热点主题雷达
+  python main.py --theme-backtest   # 主题雷达历史最小回测
         '''
     )
     
@@ -996,6 +1062,52 @@ def parse_arguments() -> argparse.Namespace:
         '--screen-no-llm',
         action='store_true',
         help='只输出规则层排序，不运行 Top N 精细 LLM 报告'
+    )
+
+    parser.add_argument(
+        '--theme-radar',
+        action='store_true',
+        help='启用热点主题雷达模式'
+    )
+
+    parser.add_argument(
+        '--theme-top-n',
+        type=int,
+        default=3,
+        help='热点主题雷达进入精细分析的候选龙头数量，默认3'
+    )
+
+    parser.add_argument(
+        '--theme-count',
+        type=int,
+        default=5,
+        help='热点主题雷达输出主题数量，默认5'
+    )
+
+    parser.add_argument(
+        '--theme-lookback-days',
+        type=int,
+        default=7,
+        help='热点主题新闻与主题回看天数，默认7'
+    )
+
+    parser.add_argument(
+        '--theme-no-llm-detail',
+        action='store_true',
+        help='只输出主题和规则层候选，不运行 Top 个股精细 LLM'
+    )
+
+    parser.add_argument(
+        '--theme-include-concepts',
+        action='store_true',
+        default=True,
+        help='热点主题雷达包含概念板块，默认启用'
+    )
+
+    parser.add_argument(
+        '--theme-backtest',
+        action='store_true',
+        help='对已保存的主题雷达历史运行最小回测'
     )
     
     return parser.parse_args()
@@ -1183,6 +1295,33 @@ def main() -> int:
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
     
     try:
+        # 模式0: 热点主题 LLM 雷达
+        if getattr(args, "theme_radar", False):
+            logger.info("模式: 热点主题 LLM 雷达")
+            pipeline = StockAnalysisPipeline(
+                config=config,
+                max_workers=args.workers
+            )
+            pipeline.run_theme_radar(
+                theme_count=args.theme_count,
+                leader_top_n=args.theme_top_n,
+                lookback_days=args.theme_lookback_days,
+                include_detail_analysis=not args.theme_no_llm_detail and not args.dry_run,
+                include_concepts=args.theme_include_concepts,
+                send_notification=not args.no_notify,
+            )
+            return 0
+
+        # 模式0.5: 热点主题历史回测
+        if getattr(args, "theme_backtest", False):
+            logger.info("模式: 热点主题历史回测")
+            pipeline = StockAnalysisPipeline(
+                config=config,
+                max_workers=args.workers
+            )
+            pipeline.run_theme_backtest(send_notification=not args.no_notify)
+            return 0
+
         # 模式0: 热门板块驱动选股
         if args.screen_hot_sectors:
             logger.info("模式: 热门板块驱动选股")

@@ -6,6 +6,11 @@
 # 测试文件（可能包含敏感配置）
 test_*.py
 !test_env.py
+!test_theme_radar.py
+!test_capital_flow.py
+!test_theme_prompt_parser.py
+!test_theme_tracker.py
+!test_theme_backtester.py
 
 # Python
 __pycache__/
