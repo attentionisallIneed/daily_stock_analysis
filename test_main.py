@@ -105,6 +105,335 @@ def test_pipeline_enhances_context_with_market_realtime_chip_and_company_data():
     assert len({pipeline._describe_volume_ratio(value) for value in [0.3, 0.6, 1.0, 1.5, 2.5, 3.5]}) == 6
 
 
+def test_pipeline_enhances_context_with_full_trend_result():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+
+    class EnumValue:
+        def __init__(self, value):
+            self.value = value
+
+    trend = SimpleNamespace(
+        instrument_type=EnumValue("stock"),
+        strategy_profile="trend",
+        strategy_notes=["note"],
+        trend_status=EnumValue("bullish"),
+        ma_alignment="long",
+        trend_strength=80,
+        bias_ma5=1.1,
+        bias_ma10=2.2,
+        bias_ma20=3.3,
+        ma60_trend="up",
+        price_vs_ma60=5.5,
+        ma60_slope=0.6,
+        medium_trend_risk="low",
+        current_price=10.0,
+        ma5=9.8,
+        ma10=9.5,
+        ma20=9.0,
+        ma60=8.5,
+        support_ma5=True,
+        support_ma10=True,
+        ma5_touch_reclaim=True,
+        ma10_touch_reclaim=False,
+        bullish_candle=True,
+        lower_shadow_ratio=0.2,
+        ma5_hold_days=3,
+        ma10_hold_days=5,
+        ma20_breakdown=False,
+        support_confirmation="confirmed",
+        support_levels=[9.5],
+        resistance_levels=[11.0],
+        pattern_signal="platform",
+        breakout_status="valid",
+        breakout_level=10.8,
+        breakout_score=75,
+        breakout_valid=True,
+        breakout_extension_threshold=12.0,
+        new_high_20d=True,
+        volume_breakout=True,
+        platform_breakout=True,
+        ma_compression_breakout=False,
+        limit_up_pullback=False,
+        breakout_retest_valid=True,
+        trend_acceleration="steady",
+        breakout_reasons=["volume"],
+        breakout_risks=["extended"],
+        volume_status=EnumValue("expanding"),
+        volume_trend="rising",
+        atr_20=0.4,
+        atr_pct=4.0,
+        volatility_20d=3.0,
+        adaptive_bias_threshold=6.0,
+        adaptive_support_tolerance=2.0,
+        relative_strength_period=20,
+        stock_return_20d=12.0,
+        benchmark_return_20d=3.0,
+        sector_return_20d=5.0,
+        stock_vs_benchmark=9.0,
+        stock_vs_sector=7.0,
+        sector_vs_benchmark=2.0,
+        relative_strength_score=88,
+        relative_strength_status="strong",
+        relative_strength_summary="beats benchmark",
+        sector_name="AI",
+        buy_signal=EnumValue("buy"),
+        signal_score=82,
+        signal_reasons=["trend"],
+        risk_factors=["gap"],
+        ideal_buy=9.9,
+        secondary_buy=9.6,
+        stop_loss=9.0,
+        take_profit=12.0,
+        risk_reward_ratio=2.5,
+        invalidation_condition="break 9",
+        position_note="normal",
+        base_position_pct=30,
+        market_position_multiplier=0.8,
+        risk_reward_position_multiplier=1.1,
+        single_trade_risk_pct=1.0,
+        max_position_by_risk_pct=40,
+        final_position_pct=26,
+    )
+    realtime = RealtimeQuote(code="000001", name="Alpha", price=10.0)
+
+    enhanced = pipeline._enhance_context(
+        {"raw_data": []},
+        realtime_quote=realtime,
+        chip_data=None,
+        company_intel=None,
+        trend_result=trend,
+        stock_name="",
+        market_context=None,
+    )
+
+    assert enhanced["stock_name"] == "Alpha"
+    assert enhanced["trend_analysis"]["instrument_type"] == "stock"
+    assert enhanced["trend_analysis"]["buy_signal"] == "buy"
+    assert enhanced["trend_analysis"]["final_position_pct"] == 26
+
+
+def test_pipeline_market_context_and_benchmark_history_are_cached(monkeypatch):
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    pipeline._market_context = None
+    pipeline._benchmark_history = None
+    pipeline._benchmark_history_loaded = False
+
+    market_calls = []
+
+    class FakeOverview:
+        def to_dict(self):
+            return {"index": "ok"}
+
+    class FakeMarketAnalyzer:
+        def __init__(self, search_service=None, analyzer=None):
+            market_calls.append((search_service, analyzer))
+
+        def get_market_overview(self):
+            return FakeOverview()
+
+    class FakeAkshare:
+        def __init__(self):
+            self.calls = 0
+
+        def get_index_daily_data(self, index_code, days=250):
+            self.calls += 1
+            return main_module.pd.DataFrame({"close": [1, 2]})
+
+    monkeypatch.setattr(main_module, "MarketAnalyzer", FakeMarketAnalyzer)
+    monkeypatch.setattr(
+        main_module,
+        "evaluate_market_environment",
+        lambda overview: {"market_score": 80, "market_status": "good", "risk_level": "low"},
+    )
+    pipeline.akshare_fetcher = FakeAkshare()
+
+    first_context = pipeline._get_market_context()
+    second_context = pipeline._get_market_context()
+    first_history = pipeline._get_benchmark_history()
+    second_history = pipeline._get_benchmark_history()
+
+    assert first_context is second_context
+    assert first_context["overview"] == {"index": "ok"}
+    assert first_context["environment"]["market_score"] == 80
+    assert market_calls == [(None, None)]
+    assert first_history is second_history
+    assert pipeline.akshare_fetcher.calls == 1
+
+    failing = object.__new__(main_module.StockAnalysisPipeline)
+    failing._market_context = None
+    failing._benchmark_history = "stale"
+    failing._benchmark_history_loaded = False
+    failing.akshare_fetcher = SimpleNamespace(get_index_daily_data=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(main_module, "MarketAnalyzer", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("no market")))
+
+    assert failing._get_market_context()["environment"]["market_score"] == 50
+    assert failing._get_benchmark_history() is None
+
+
+def test_pipeline_process_single_stock_and_run_cover_success_dry_run_and_empty_paths():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    result = SimpleNamespace(code="000001", sentiment_score=90, operation_advice="buy")
+    calls = []
+
+    pipeline.config = SimpleNamespace(stock_list=["000001"])
+    pipeline.max_workers = 1
+    pipeline.user_manager = SimpleNamespace(has_users=lambda: True, get_all_stocks=lambda: ["600519"])
+    pipeline.db = SimpleNamespace(has_today_data=lambda code: code == "000001")
+    pipeline._send_notifications = lambda results: calls.append(("notify", [item.code for item in results]))
+
+    def process(code, skip_analysis=False):
+        calls.append(("process", code, skip_analysis))
+        return result if code == "000001" and not skip_analysis else None
+
+    pipeline.process_single_stock = process
+
+    assert pipeline.run(stock_codes=[], dry_run=False) == []
+    assert pipeline.run(stock_codes=None, dry_run=False, send_notification=True) == [result]
+    assert ("notify", ["000001"]) in calls
+    dry_results = pipeline.run(stock_codes=["000001", "600519"], dry_run=True, send_notification=True)
+    assert dry_results == []
+    assert ("process", "000001", True) in calls
+
+    single = object.__new__(main_module.StockAnalysisPipeline)
+    single.fetch_and_save_stock_data = lambda code: (False, "fetch failed")
+    single.analyze_stock = lambda code: result
+    assert single.process_single_stock("000001") is result
+    assert single.process_single_stock("000001", skip_analysis=True) is None
+
+    exploding = object.__new__(main_module.StockAnalysisPipeline)
+    exploding.fetch_and_save_stock_data = lambda code: (_ for _ in ()).throw(RuntimeError("boom"))
+    assert exploding.process_single_stock("000001") is None
+
+
+def test_pipeline_send_notifications_routes_channels_and_user_reports():
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    calls = []
+    result_a = SimpleNamespace(code="000001")
+    result_b = SimpleNamespace(code="600519")
+
+    class FakeNotifier:
+        def generate_dashboard_report(self, results):
+            calls.append(("dashboard", [item.code for item in results]))
+            return "report:" + ",".join(item.code for item in results)
+
+        def save_report_to_file(self, report):
+            calls.append(("save", report))
+            return "saved.md"
+
+        def is_available(self):
+            return True
+
+        def get_available_channels(self):
+            return [
+                main_module.NotificationChannel.WECHAT,
+                main_module.NotificationChannel.FEISHU,
+                main_module.NotificationChannel.TELEGRAM,
+                main_module.NotificationChannel.EMAIL,
+                main_module.NotificationChannel.CUSTOM,
+                "unknown",
+            ]
+
+        def generate_wechat_dashboard(self, results):
+            calls.append(("wechat-dashboard", len(results)))
+            return "wechat report"
+
+        def send_to_wechat(self, content):
+            calls.append(("wechat", content))
+            return False
+
+        def send_to_feishu(self, report):
+            calls.append(("feishu", report))
+            return True
+
+        def send_to_telegram(self, report):
+            calls.append(("telegram", report))
+            return False
+
+        def send_to_email(self, report, receivers=None):
+            calls.append(("email", report, receivers))
+            return True
+
+        def send_to_custom(self, report):
+            calls.append(("custom", report))
+            return False
+
+    pipeline.notifier = FakeNotifier()
+    pipeline.config = SimpleNamespace(email_receivers=["admin@example.com"])
+    pipeline.user_manager = SimpleNamespace(
+        has_users=lambda: True,
+        get_users=lambda: [
+            SimpleNamespace(name="Ann", email="ann@example.com", stocks=["000001"]),
+            SimpleNamespace(name="Ben", email="ben@example.com", stocks=[]),
+        ],
+    )
+
+    pipeline._send_notifications([result_a, result_b])
+
+    assert ("wechat", "wechat report") in calls
+    assert ("feishu", "report:000001,600519") in calls
+    assert ("email", "report:000001", ["ann@example.com"]) in calls
+    assert ("email", "report:000001,600519", None) in calls
+    assert ("custom", "report:000001,600519") in calls
+
+    unavailable = object.__new__(main_module.StockAnalysisPipeline)
+    unavailable.notifier = SimpleNamespace(
+        generate_dashboard_report=lambda results: "report",
+        save_report_to_file=lambda report: "saved.md",
+        is_available=lambda: False,
+    )
+    unavailable._send_notifications([result_a])
+
+
+def test_pipeline_hot_sector_screening_runs_details_and_sends_report(monkeypatch):
+    pipeline = object.__new__(main_module.StockAnalysisPipeline)
+    calls = []
+    detail = SimpleNamespace(code="000001")
+
+    class FakeScreeningResult:
+        def __init__(self):
+            self.selected = [SimpleNamespace(code="000001"), SimpleNamespace(code="600519")]
+            self.detailed_results = []
+            self.candidates = [1, 2, 3]
+            self.filtered = [1]
+
+        def format_report(self):
+            calls.append(("format", len(self.detailed_results)))
+            return "screen report"
+
+    class FakeScreener:
+        def __init__(self, daily_fetcher=None, sector_fetcher=None, trend_analyzer=None):
+            calls.append(("screener", daily_fetcher, sector_fetcher, trend_analyzer))
+
+        def screen_hot_sectors(self, sector_count=5, top_n=3):
+            calls.append(("screen", sector_count, top_n))
+            return FakeScreeningResult()
+
+    class FakeNotifier:
+        def save_report_to_file(self, report, filename):
+            calls.append(("save", report, filename))
+            return "screen.md"
+
+        def is_available(self):
+            return True
+
+        def send(self, report):
+            calls.append(("send", report))
+            return True
+
+    monkeypatch.setattr(main_module, "StockScreener", FakeScreener)
+    pipeline.fetcher_manager = "daily"
+    pipeline.akshare_fetcher = "sector"
+    pipeline.trend_analyzer = "trend"
+    pipeline.notifier = FakeNotifier()
+    pipeline.process_single_stock = lambda code, skip_analysis=False: detail if code == "000001" else None
+
+    screening_result = pipeline.run_hot_sector_screening(top_n=2, sector_count=4, run_llm=True, send_notification=True)
+
+    assert screening_result.detailed_results == [detail]
+    assert ("screen", 4, 2) in calls
+    assert ("send", "screen report") in calls
+
+
 def test_run_market_review_saves_and_sends_report(monkeypatch):
     class FakeMarketAnalyzer:
         def __init__(self, search_service=None, analyzer=None):
