@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 
 import notification
 from analyzer import AnalysisResult
@@ -402,3 +403,119 @@ def test_email_sender_uses_ssl_tls_and_receiver_guards(monkeypatch):
     )
     assert tls_service.send_to_email("# Report", subject="Subject") is True
     assert any(event[0] == "starttls" for event in events)
+
+
+def test_notification_remaining_edge_branches_are_mocked(monkeypatch):
+    service = _service()
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    traditional = service.generate_dashboard_report(
+        [
+            _result(
+                dashboard=None,
+                buy_reason="fallback reason",
+                risk_warning="fallback risk",
+                ma_analysis="fallback ma",
+                volume_analysis="fallback volume",
+                news_summary="fallback news",
+            )
+        ]
+    )
+    assert "fallback reason" in traditional
+    assert "fallback news" in traditional
+
+    long_dashboard = _dashboard()
+    long_dashboard["core_conclusion"]["one_sentence"] = "x" * 5000
+    long_dashboard["battle_plan"]["action_checklist"] = ["鈿狅笍 failed trend"]
+    shortened = service.generate_wechat_dashboard([_result(dashboard=long_dashboard)])
+    assert len(shortened) <= 3820
+
+    wechat_calls = []
+
+    def partly_failing_wechat(content):
+        wechat_calls.append(content)
+        return len(wechat_calls) != 2
+
+    service._send_wechat_message = partly_failing_wechat
+    assert service._send_wechat_chunked("intro\n### " + "a" * 80 + "\n### " + "b" * 80, max_bytes=120) is False
+
+    service._send_wechat_message = lambda content: (_ for _ in ()).throw(RuntimeError("wechat boom"))
+    assert service._send_wechat_force_chunked("line\n" + "x" * 220, max_bytes=130) is False
+
+    feishu_calls = []
+
+    def partly_failing_feishu(content):
+        feishu_calls.append(content)
+        return len(feishu_calls) != 2
+
+    service._send_feishu_message = partly_failing_feishu
+    assert service._send_feishu_chunked("intro\n### " + "a" * 80 + "\n### " + "b" * 80, max_bytes=120) is False
+
+    service._send_feishu_message = lambda content: (_ for _ in ()).throw(RuntimeError("feishu boom"))
+    assert service._send_feishu_force_chunked("line\n" + "x" * 220, max_bytes=130) is False
+
+    assert _service().send("content") is False
+
+    dispatch = _service(_available_channels=[NotificationChannel.WECHAT])
+    dispatch.send_to_wechat = lambda content: (_ for _ in ()).throw(RuntimeError("dispatch boom"))
+    assert dispatch.send("content") is False
+
+    generic_chunker = _service()
+    generic_chunker.send = lambda content: False
+    assert generic_chunker._send_chunked_messages("a" * 40 + "\n---\n" + "b" * 40, max_length=30) is False
+
+    delivery = _service(
+        _wechat_url="https://wechat.example/hook",
+        _feishu_url="https://feishu.example/hook",
+        _telegram_config={"bot_token": "token", "chat_id": "chat"},
+    )
+    delivery._send_wechat_message = lambda content: (_ for _ in ()).throw(RuntimeError("wechat send"))
+    delivery._send_feishu_message = lambda content: (_ for _ in ()).throw(RuntimeError("feishu send"))
+    delivery._send_telegram_message = lambda api_url, chat_id, text: (_ for _ in ()).throw(RuntimeError("telegram send"))
+    assert delivery.send_to_wechat("short") is False
+    assert delivery.send_to_feishu("short") is False
+    assert delivery.send_to_telegram("short") is False
+
+    webhook = _service(_custom_webhook_urls=["https://example.com/hook"])
+    monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("webhook")))
+    assert webhook.send_to_custom("content") is False
+
+    class FakeSMTP:
+        def __init__(self, server, port, timeout):
+            self.server = server
+
+        def login(self, sender, password):
+            return None
+
+        def send_message(self, message):
+            return None
+
+        def quit(self):
+            return None
+
+    unknown_email = _service(
+        _email_config={"sender": "sender@example.test", "password": "secret", "receivers": ["to@example.com"]}
+    )
+    monkeypatch.setattr(notification.smtplib, "SMTP_SSL", FakeSMTP)
+    assert unknown_email.send_to_email("# Report") is True
+
+    monkeypatch.setattr(
+        notification.smtplib,
+        "SMTP_SSL",
+        lambda *args, **kwargs: (_ for _ in ()).throw(notification.smtplib.SMTPAuthenticationError(535, b"bad")),
+    )
+    assert unknown_email.send_to_email("# Report") is False
+
+    monkeypatch.setattr(
+        notification.smtplib,
+        "SMTP_SSL",
+        lambda *args, **kwargs: (_ for _ in ()).throw(notification.smtplib.SMTPConnectError(421, "down")),
+    )
+    assert unknown_email.send_to_email("# Report") is False
+
+    monkeypatch.setattr(
+        notification.smtplib,
+        "SMTP_SSL",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("smtp down")),
+    )
+    assert unknown_email.send_to_email("# Report") is False
