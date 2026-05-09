@@ -516,22 +516,48 @@ class AkshareFetcher(BaseFetcher):
 
     def get_hot_sectors(self, sector_count: int = 5, include_concepts: bool = True) -> List[Dict[str, Any]]:
         """获取当日热门行业/概念板块，用于主动选股粗筛。"""
-        sector_sources = [("industry", "ak.stock_board_industry_name_em", ak.stock_board_industry_name_em)]
+        sector_sources = [
+            (
+                "industry",
+                "ak.stock_board_industry_name_em",
+                ak.stock_board_industry_name_em,
+                "ak.stock_board_industry_summary_ths",
+                ak.stock_board_industry_summary_ths,
+            )
+        ]
         if include_concepts:
-            sector_sources.append(("concept", "ak.stock_board_concept_name_em", ak.stock_board_concept_name_em))
+            sector_sources.append(
+                (
+                    "concept",
+                    "ak.stock_board_concept_name_em",
+                    ak.stock_board_concept_name_em,
+                    "ak.stock_board_concept_summary_ths",
+                    ak.stock_board_concept_summary_ths,
+                )
+            )
 
         sectors: List[Dict[str, Any]] = []
-        for sector_type, api_name, fetch_func in sector_sources:
+        for sector_type, api_name, fetch_func, fallback_api_name, fallback_fetch_func in sector_sources:
             try:
                 self._set_random_user_agent()
                 self._enforce_rate_limit()
                 with self._without_proxy():
-                    df = self._fetch_with_retry(api_name, fetch_func)
+                    try:
+                        df = self._fetch_with_retry(api_name, fetch_func)
+                    except Exception as e:
+                        logger.warning(f"[板块] 获取{sector_type}热门板块主接口失败，尝试备用接口: {e}")
+                        df = self._fetch_with_retry(fallback_api_name, fallback_fetch_func)
                 if df is None or df.empty:
                     continue
 
                 for _, row in df.iterrows():
-                    name = str(row.get("板块名称") or row.get("名称") or "").strip()
+                    name = str(
+                        row.get("板块名称")
+                        or row.get("名称")
+                        or row.get("板块")
+                        or row.get("概念名称")
+                        or ""
+                    ).strip()
                     if not name:
                         continue
                     sectors.append(
@@ -539,11 +565,12 @@ class AkshareFetcher(BaseFetcher):
                             "name": name,
                             "code": str(row.get("板块代码") or row.get("代码") or ""),
                             "sector_type": sector_type,
-                            "rank": int(self._safe_float_value(row.get("排名"), len(sectors) + 1)),
+                            "rank": int(self._safe_float_value(row.get("排名") or row.get("序号"), len(sectors) + 1)),
                             "change_pct": self._safe_float_value(row.get("涨跌幅")),
                             "turnover_rate": self._safe_float_value(row.get("换手率")),
-                            "amount": self._safe_float_value(row.get("成交额")),
-                            "leading_stock": str(row.get("领涨股票") or ""),
+                            "amount": self._safe_float_value(row.get("成交额") or row.get("总成交额")),
+                            "main_net_inflow": self._safe_float_value(row.get("净流入")),
+                            "leading_stock": str(row.get("领涨股票") or row.get("领涨股") or row.get("龙头股") or ""),
                         }
                     )
             except Exception as e:

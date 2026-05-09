@@ -225,7 +225,9 @@ def test_market_analyzer_collects_market_data_from_mocked_akshare(monkeypatch):
         if api_name == "ak.stock_hsgt_north_net_flow_in_em":
             raise AttributeError("removed")
         if api_name == "ak.stock_hsgt_fund_flow_summary_em":
-            return pd.DataFrame({COL_TODAY_NET_BUY: [3e8]})
+            return pd.DataFrame({COL_TODAY_NET_BUY: [3.0]})
+        if api_name == "ak.stock_hsgt_hist_em":
+            raise AssertionError("history fallback should not run when summary has data")
         raise AssertionError(api_name)
 
     monkeypatch.setattr(market_module, "_call_akshare_with_retry", fake_akshare)
@@ -249,6 +251,77 @@ def test_market_analyzer_collects_market_data_from_mocked_akshare(monkeypatch):
     assert overview.bottom_sectors[0] == {"name": "Banks", "change_pct": -2.0}
     assert overview.north_flow == 3.0
     assert "ak.stock_hsgt_fund_flow_summary_em" in calls
+
+
+def test_market_analyzer_extracts_north_flow_from_history_fallback(monkeypatch):
+    calls = []
+
+    def fake_akshare(api_name, fetch_func):
+        calls.append(api_name)
+        if api_name == "ak.stock_hsgt_fund_flow_summary_em":
+            return pd.DataFrame({"成交净买额": [0.0], "资金方向": ["北向"]})
+        if api_name == "ak.stock_hsgt_hist_em":
+            return pd.DataFrame({"当日成交净买额": [None, 12.5]})
+        raise AssertionError(api_name)
+
+    monkeypatch.setattr(market_module.ak, "stock_hsgt_north_net_flow_in_em", None, raising=False)
+    monkeypatch.setattr(market_module, "_call_akshare_with_retry", fake_akshare)
+
+    analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    overview = MarketOverview(date="2026-01-01")
+    analyzer._get_north_flow(overview)
+
+    assert overview.north_flow == 12.5
+    assert calls == [
+        "ak.stock_hsgt_north_net_flow_in_em",
+        "ak.stock_hsgt_fund_flow_summary_em",
+        "ak.stock_hsgt_hist_em",
+    ]
+
+
+def test_market_analyzer_collects_market_data_from_fallback_akshare(monkeypatch):
+    calls = []
+
+    def fake_akshare(api_name, fetch_func):
+        calls.append(api_name)
+        if api_name in {"ak.stock_zh_index_spot_em", "ak.stock_board_industry_name_em"}:
+            raise RuntimeError("eastmoney down")
+        if api_name == "ak.stock_zh_index_spot_sina":
+            return pd.DataFrame(
+                {
+                    COL_CODE: ["000001", "399001"],
+                    COL_PRICE: [3000, 10000],
+                    COL_CHANGE_AMOUNT: [10, 20],
+                    COL_CHANGE: [0.5, 1.2],
+                    COL_OPEN_TODAY: [2990, 9900],
+                    COL_HIGH: [3010, 10100],
+                    COL_LOW: [2980, 9800],
+                    COL_PREV_CLOSE: [2990, 9980],
+                    COL_VOLUME: [100, 200],
+                    COL_AMOUNT: [1e8, 2e8],
+                }
+            )
+        if api_name == "ak.stock_board_industry_summary_ths":
+            return pd.DataFrame(
+                {
+                    "板块": ["Robotics", "Banks"],
+                    COL_CHANGE: [4.0, -1.5],
+                }
+            )
+        raise AssertionError(api_name)
+
+    monkeypatch.setattr(market_module, "_call_akshare_with_retry", fake_akshare)
+
+    analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    overview = MarketOverview(date="2026-01-01")
+    overview.indices = analyzer._get_main_indices()
+    analyzer._get_sector_rankings(overview)
+
+    assert [index.code for index in overview.indices] == ["000001", "399001"]
+    assert overview.top_sectors[0] == {"name": "Robotics", "change_pct": 4.0}
+    assert overview.bottom_sectors[0] == {"name": "Banks", "change_pct": -1.5}
+    assert "ak.stock_zh_index_spot_sina" in calls
+    assert "ak.stock_board_industry_summary_ths" in calls
 
 
 def test_market_review_uses_ai_when_available_and_falls_back_on_failure():

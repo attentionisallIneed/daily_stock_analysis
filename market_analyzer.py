@@ -38,6 +38,19 @@ def _call_akshare_with_retry(api_name: str, fetch_func):
     return fetch_func()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        if isinstance(value, str):
+            value = value.replace("%", "").replace(",", "").strip()
+            if value in {"", "-", "--"}:
+                return default
+        return float(value)
+    except Exception:
+        return default
+
+
 @contextmanager
 def temporary_no_proxy():
     """
@@ -289,47 +302,54 @@ class MarketAnalyzer:
     def _get_main_indices(self) -> List[MarketIndex]:
         """获取主要指数实时行情"""
         indices = []
-        
+        df = None
+        source_name = "ak.stock_zh_index_spot_em"
+
         try:
             logger.info("[大盘] 获取主要指数实时行情...")
-            
-            # 使用 akshare 获取指数行情
+
+            # 使用 akshare 获取指数行情，东方财富接口不可用时回退到新浪接口
             with temporary_no_proxy():
-                df = _call_akshare_with_retry("ak.stock_zh_index_spot_em", ak.stock_zh_index_spot_em)
-            
+                try:
+                    df = _call_akshare_with_retry(source_name, ak.stock_zh_index_spot_em)
+                except Exception as e:
+                    logger.warning(f"[大盘] 东方财富指数接口失败，尝试新浪接口: {e}")
+                    source_name = "ak.stock_zh_index_spot_sina"
+                    df = _call_akshare_with_retry(source_name, ak.stock_zh_index_spot_sina)
+
             if df is not None and not df.empty:
                 for code, name in self.MAIN_INDICES.items():
                     # 查找对应指数
                     row = df[df['代码'] == code]
                     if row.empty:
                         # 尝试带前缀查找
-                        row = df[df['代码'].str.contains(code)]
-                    
+                        row = df[df['代码'].astype(str).str.contains(code, na=False)]
+
                     if not row.empty:
                         row = row.iloc[0]
                         index = MarketIndex(
                             code=code,
                             name=name,
-                            current=float(row.get('最新价', 0) or 0),
-                            change=float(row.get('涨跌额', 0) or 0),
-                            change_pct=float(row.get('涨跌幅', 0) or 0),
-                            open=float(row.get('今开', 0) or 0),
-                            high=float(row.get('最高', 0) or 0),
-                            low=float(row.get('最低', 0) or 0),
-                            prev_close=float(row.get('昨收', 0) or 0),
-                            volume=float(row.get('成交量', 0) or 0),
-                            amount=float(row.get('成交额', 0) or 0),
+                            current=_safe_float(row.get('最新价')),
+                            change=_safe_float(row.get('涨跌额')),
+                            change_pct=_safe_float(row.get('涨跌幅')),
+                            open=_safe_float(row.get('今开')),
+                            high=_safe_float(row.get('最高')),
+                            low=_safe_float(row.get('最低')),
+                            prev_close=_safe_float(row.get('昨收')),
+                            volume=_safe_float(row.get('成交量')),
+                            amount=_safe_float(row.get('成交额')),
                         )
                         # 计算振幅
                         if index.prev_close > 0:
                             index.amplitude = (index.high - index.low) / index.prev_close * 100
                         indices.append(index)
-                        
-                logger.info(f"[大盘] 获取到 {len(indices)} 个指数行情")
-                
+
+                logger.info(f"[大盘] 获取到 {len(indices)} 个指数行情，来源: {source_name}")
+
         except Exception as e:
             logger.error(f"[大盘] 获取指数行情失败: {e}")
-        
+
         return indices
     
     def _get_market_statistics(self, overview: MarketOverview):
@@ -371,34 +391,42 @@ class MarketAnalyzer:
         """获取板块涨跌榜"""
         try:
             logger.info("[大盘] 获取板块涨跌榜...")
-            
-            # 获取行业板块行情
+            df = None
+            source_name = "ak.stock_board_industry_name_em"
+
+            # 获取行业板块行情，东方财富接口不可用时回退到同花顺行业摘要
             with temporary_no_proxy():
-                df = _call_akshare_with_retry("ak.stock_board_industry_name_em", ak.stock_board_industry_name_em)
-            
+                try:
+                    df = _call_akshare_with_retry(source_name, ak.stock_board_industry_name_em)
+                except Exception as e:
+                    logger.warning(f"[大盘] 东方财富行业板块接口失败，尝试同花顺接口: {e}")
+                    source_name = "ak.stock_board_industry_summary_ths"
+                    df = _call_akshare_with_retry(source_name, ak.stock_board_industry_summary_ths)
+
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
-                if change_col in df.columns:
+                name_col = '板块名称' if '板块名称' in df.columns else '板块'
+                if change_col in df.columns and name_col in df.columns:
                     df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
                     df = df.dropna(subset=[change_col])
-                    
+
                     # 涨幅前5
                     top = df.nlargest(5, change_col)
                     overview.top_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
+                        {'name': row[name_col], 'change_pct': row[change_col]}
                         for _, row in top.iterrows()
                     ]
-                    
+
                     # 跌幅前5
                     bottom = df.nsmallest(5, change_col)
                     overview.bottom_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
+                        {'name': row[name_col], 'change_pct': row[change_col]}
                         for _, row in bottom.iterrows()
                     ]
-                    
-                    logger.info(f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}")
+
+                    logger.info(f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}，来源: {source_name}")
                     logger.info(f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]}")
-                    
+
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
     
@@ -406,44 +434,62 @@ class MarketAnalyzer:
         """获取北向资金流入"""
         try:
             logger.info("[大盘] 获取北向资金...")
-            
-            # 获取北向资金数据
-            # 修复: akshare >= 1.18.13 移除了 stock_hsgt_north_net_flow_in_em
-            # 改用 stock_hsgt_fund_flow_summary_em
-            with temporary_no_proxy():
-                try:
-                    df = _call_akshare_with_retry(
-                        "ak.stock_hsgt_north_net_flow_in_em",
-                        lambda: ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
-                    )
-                except AttributeError:
-                    logger.warning("[大盘] akshare原接口不可用，尝试使用新接口...")
-                    df = _call_akshare_with_retry("ak.stock_hsgt_fund_flow_summary_em", ak.stock_hsgt_fund_flow_summary_em)
-            
-            if df is not None and not df.empty:
-                # 取最新一条数据
-                latest = df.iloc[-1]
-                # 兼容不同接口的字段名
-                flow_val = 0.0
-                if '当日净流入' in df.columns:
-                    flow_val = float(latest['当日净流入'])
-                elif '净流入' in df.columns:
-                    flow_val = float(latest['净流入'])
-                elif '北向资金今日净买额' in df.columns: # 可能的新字段
-                     flow_val = float(latest['北向资金今日净买额'])
-                elif '今日净买额' in df.columns: # 可能的新字段
-                     flow_val = float(latest['今日净买额'])
-                
-                # 如果没找到字段但有数据，打印列名以便调试
-                if flow_val == 0.0 and len(df.columns) > 0:
-                     logger.debug(f"[大盘] 北向资金列名: {df.columns.tolist()}")
 
-                overview.north_flow = flow_val / 1e8  # 转为亿元
-                    
+            # 获取北向资金数据
+            # akshare >= 1.18.13 移除了 stock_hsgt_north_net_flow_in_em，优先使用新接口
+            with temporary_no_proxy():
+                if hasattr(ak, "stock_hsgt_north_net_flow_in_em"):
+                    try:
+                        df = _call_akshare_with_retry(
+                            "ak.stock_hsgt_north_net_flow_in_em",
+                            lambda: ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+                        )
+                    except Exception as e:
+                        logger.warning(f"[大盘] akshare原北向接口不可用，尝试新接口: {e}")
+                        df = _call_akshare_with_retry("ak.stock_hsgt_fund_flow_summary_em", ak.stock_hsgt_fund_flow_summary_em)
+                else:
+                    df = _call_akshare_with_retry("ak.stock_hsgt_fund_flow_summary_em", ak.stock_hsgt_fund_flow_summary_em)
+
+            if df is not None and not df.empty:
+                flow_val = self._extract_north_flow_value(df)
+                if flow_val == 0.0 and hasattr(ak, "stock_hsgt_hist_em"):
+                    with temporary_no_proxy():
+                        hist_df = _call_akshare_with_retry(
+                            "ak.stock_hsgt_hist_em",
+                            lambda: ak.stock_hsgt_hist_em(symbol="北向资金"),
+                        )
+                    flow_val = self._extract_north_flow_value(hist_df)
+                overview.north_flow = flow_val
+
                 logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
-                
+
         except Exception as e:
             logger.warning(f"[大盘] 获取北向资金失败: {e}")
+
+    @staticmethod
+    def _extract_north_flow_value(df: pd.DataFrame) -> float:
+        if df is None or df.empty:
+            return 0.0
+        if '成交净买额' in df.columns:
+            north_rows = df
+            if '资金方向' in df.columns:
+                north_rows = df[df['资金方向'].astype(str).str.contains('北向|北上', na=False)]
+            if north_rows.empty:
+                north_rows = df
+            return round(pd.to_numeric(north_rows['成交净买额'], errors='coerce').fillna(0).sum(), 2)
+
+        for column in ('当日成交净买额', '当日净流入', '净流入', '北向资金今日净买额', '今日净买额', '资金净流入', '当日资金流入'):
+            if column not in df.columns:
+                continue
+            values = pd.to_numeric(df[column], errors='coerce').dropna()
+            if values.empty:
+                continue
+            value = float(values.iloc[-1])
+            if abs(value) > 10000:
+                value = value / 1e8
+            return round(value, 2)
+        logger.debug(f"[大盘] 北向资金列名: {df.columns.tolist()}")
+        return 0.0
     
     def search_market_news(self) -> List[Dict]:
         """

@@ -611,6 +611,47 @@ def test_akshare_hot_sectors_and_constituents_from_mocked_apis():
     assert "ak.stock_board_concept_cons_em" in calls
 
 
+def test_akshare_hot_sectors_falls_back_to_ths_sources():
+    fetcher = _quiet_akshare_fetcher()
+    calls = []
+
+    def fake_fetch(api_name, fetch_func):
+        calls.append(api_name)
+        if api_name in {"ak.stock_board_industry_name_em", "ak.stock_board_concept_name_em"}:
+            raise RuntimeError("eastmoney down")
+        if api_name == "ak.stock_board_industry_summary_ths":
+            return pd.DataFrame(
+                {
+                    "序号": [1],
+                    "板块": ["Industry THS"],
+                    COL_CHANGE: [3.3],
+                    "总成交额": [1000],
+                    "净流入": [52.7],
+                    "领涨股": ["Leader I"],
+                }
+            )
+        if api_name == "ak.stock_board_concept_summary_ths":
+            return pd.DataFrame(
+                {
+                    "概念名称": ["Concept THS"],
+                    "龙头股": ["Leader C"],
+                }
+            )
+        raise AssertionError(api_name)
+
+    fetcher._fetch_with_retry = fake_fetch
+
+    sectors = fetcher.get_hot_sectors(sector_count=2, include_concepts=True)
+
+    assert sectors[0]["name"] == "Industry THS"
+    assert sectors[0]["change_pct"] == 3.3
+    assert sectors[0]["main_net_inflow"] == 52.7
+    assert sectors[1]["name"] == "Concept THS"
+    assert sectors[1]["leading_stock"] == "Leader C"
+    assert "ak.stock_board_industry_summary_ths" in calls
+    assert "ak.stock_board_concept_summary_ths" in calls
+
+
 def test_akshare_sector_and_index_history_are_cleaned_and_indicator_enriched():
     fetcher = _quiet_akshare_fetcher()
     api_calls = []
