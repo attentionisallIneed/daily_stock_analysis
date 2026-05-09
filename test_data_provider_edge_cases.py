@@ -43,6 +43,33 @@ def test_base_fetcher_stubs_and_default_manager_sorting(monkeypatch):
 
     assert manager.available_fetchers == ["first", "ak", "ts", "bs", "yf"]
 
+    class UnavailableFetcher(FakeFetcher):
+        is_available = False
+
+    monkeypatch.setattr(tushare_fetcher_module, "TushareFetcher", lambda: UnavailableFetcher("ts", 2))
+    manager_without_unavailable = DataFetcherManager()
+    assert manager_without_unavailable.available_fetchers == ["ak", "bs", "yf"]
+
+
+def test_default_manager_skips_unavailable_fetchers(monkeypatch):
+    class FakeFetcher:
+        def __init__(self, name, priority, is_available=True):
+            self.name = name
+            self.priority = priority
+            self.is_available = is_available
+
+        def get_daily_data(self, **kwargs):
+            return pd.DataFrame()
+
+    monkeypatch.setattr(akshare_fetcher_module, "AkshareFetcher", lambda: FakeFetcher("ak", 1))
+    monkeypatch.setattr(tushare_fetcher_module, "TushareFetcher", lambda: FakeFetcher("ts", 2, is_available=False))
+    monkeypatch.setattr(baostock_fetcher_module, "BaostockFetcher", lambda: FakeFetcher("bs", 3))
+    monkeypatch.setattr(yfinance_fetcher_module, "YfinanceFetcher", lambda: FakeFetcher("yf", 4))
+
+    manager = DataFetcherManager()
+
+    assert manager.available_fetchers == ["ak", "bs", "yf"]
+
 
 def test_baostock_lazy_import_logout_and_wrapped_query_errors(monkeypatch):
     imported = SimpleNamespace()
@@ -101,6 +128,7 @@ def test_tushare_init_api_success_failure_and_counter_reset(monkeypatch):
     fetcher = TushareFetcher()
 
     assert fetcher._api is not None
+    assert fetcher.is_available is True
     assert calls == [("token", "token"), ("pro_api",)]
 
     class BrokenTushare(FakeTushare):
@@ -110,6 +138,7 @@ def test_tushare_init_api_success_failure_and_counter_reset(monkeypatch):
     monkeypatch.setitem(sys.modules, "tushare", BrokenTushare())
     failed = TushareFetcher()
     assert failed._api is None
+    assert failed.is_available is False
 
     limiter = object.__new__(TushareFetcher)
     limiter.rate_limit_per_minute = 10

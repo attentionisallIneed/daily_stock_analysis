@@ -108,3 +108,29 @@ def test_data_fetcher_manager_reports_all_failures():
     message = str(excinfo.value)
     assert "first failed" in message
     assert "second failed" in message
+
+
+def test_data_fetcher_manager_reports_empty_provider_results():
+    class EmptyFetcher:
+        def __init__(self, name, priority):
+            self.name = name
+            self.priority = priority
+            self.calls = []
+
+        def get_daily_data(self, **kwargs):
+            self.calls.append(kwargs)
+            return pd.DataFrame()
+
+    first = EmptyFetcher("empty-first", 1)
+    second = EmptyFetcher("empty-second", 2)
+    manager = DataFetcherManager(fetchers=[first, second])
+
+    with pytest.raises(DataFetchError) as excinfo:
+        manager.get_daily_data("000001", start_date="2026-01-01", end_date="2026-01-02")
+
+    message = str(excinfo.value)
+    assert "empty-first" in message
+    assert "empty-second" in message
+    assert "返回空数据" in message
+    assert first.calls
+    assert second.calls

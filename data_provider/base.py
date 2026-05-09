@@ -271,12 +271,13 @@ class DataFetcherManager:
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
         
-        self._fetchers = [
+        fetchers = [
             AkshareFetcher(),
             TushareFetcher(),
             BaostockFetcher(),
             YfinanceFetcher(),
         ]
+        self._fetchers = [fetcher for fetcher in fetchers if getattr(fetcher, "is_available", True)]
         
         # 按优先级排序
         self._fetchers.sort(key=lambda f: f.priority)
@@ -332,6 +333,10 @@ class DataFetcherManager:
                 if df is not None and not df.empty:
                     logger.info(f"[{fetcher.name}] 成功获取 {stock_code}")
                     return df, fetcher.name
+
+                error_msg = f"[{fetcher.name}] 失败: 返回空数据"
+                logger.warning(error_msg)
+                errors.append(error_msg)
                     
             except Exception as e:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)}"

@@ -81,6 +81,34 @@ def test_base_search_provider_records_success_and_failures():
     assert saturated._key_errors["a"] == 1
 
 
+def test_base_search_provider_falls_back_to_next_key():
+    class PerKeyProvider(BaseSearchProvider):
+        def __init__(self):
+            super().__init__(["bad-key", "good-key"], "per-key")
+            self.calls = []
+
+        def _do_search(self, query, api_key, max_results):
+            self.calls.append(api_key)
+            if api_key == "bad-key":
+                raise RuntimeError("quota exhausted")
+            return SearchResponse(
+                query=query,
+                results=[SearchResult("ok", "summary", "https://example.com", "example.com")],
+                provider=self.name,
+                success=True,
+            )
+
+    provider = PerKeyProvider()
+
+    response = provider.search("demo")
+
+    assert response.success is True
+    assert response.provider == "per-key"
+    assert provider.calls == ["bad-key", "good-key"]
+    assert provider._key_errors["bad-key"] == 1
+    assert provider._key_usage["good-key"] == 1
+
+
 def test_tavily_and_serpapi_providers_parse_success_and_error_paths(monkeypatch):
     tavily_module = types.ModuleType("tavily")
     serpapi_module = types.ModuleType("serpapi")
@@ -235,6 +263,26 @@ def test_search_service_events_comprehensive_report_and_singleton(monkeypatch):
     assert singleton.is_available is True
     search_module.reset_search_service()
     assert search_module._search_service is None
+
+
+def test_comprehensive_intel_falls_back_per_dimension(monkeypatch):
+    monkeypatch.setattr("search_service.time.sleep", lambda seconds: None)
+    failing = FakeSearchProvider(
+        name="failing",
+        response=SearchResponse("q", [], "failing", success=False, error_message="provider down"),
+    )
+    succeeding = FakeSearchProvider(name="succeeding")
+    service = SearchService()
+    service._providers = [failing, succeeding]
+
+    intel = service.search_comprehensive_intel("000001", "TestStock", max_searches=1)
+
+    assert set(intel) == {"latest_news"}
+    assert intel["latest_news"].success is True
+    assert intel["latest_news"].provider == "succeeding"
+    assert failing.calls
+    assert succeeding.calls
+    assert failing.calls[0][0] == succeeding.calls[0][0]
 
 
 def test_search_service_handles_unavailable_and_batch_search(monkeypatch):

@@ -68,6 +68,11 @@ class TushareFetcher(BaseFetcher):
         
         # 尝试初始化 API
         self._init_api()
+
+    @property
+    def is_available(self) -> bool:
+        """Tushare 只有在 token/API 初始化成功后才参与默认取数链路。"""
+        return self._api is not None
     
     def _init_api(self) -> None:
         """

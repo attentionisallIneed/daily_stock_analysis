@@ -135,8 +135,7 @@ class BaseSearchProvider(ABC):
         Returns:
             SearchResponse 对象
         """
-        api_key = self._get_next_key()
-        if not api_key:
+        if not self._api_keys:
             return SearchResponse(
                 query=query,
                 results=[],
@@ -146,30 +145,57 @@ class BaseSearchProvider(ABC):
             )
         
         start_time = time.time()
-        try:
-            response = self._do_search(query, api_key, max_results)
-            response.search_time = time.time() - start_time
-            
-            if response.success:
-                self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
-            else:
+        attempted_keys = set()
+        last_response: Optional[SearchResponse] = None
+        last_error: Optional[Exception] = None
+
+        for _ in range(len(self._api_keys)):
+            api_key = self._get_next_key()
+            if not api_key or api_key in attempted_keys:
+                break
+            attempted_keys.add(api_key)
+
+            try:
+                response = self._do_search(query, api_key, max_results)
+                response.search_time = time.time() - start_time
+                
+                if response.success:
+                    self._record_success(api_key)
+                    logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
+                    return response
+
                 self._record_error(api_key)
-            
-            return response
-            
-        except Exception as e:
-            self._record_error(api_key)
-            elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
+                last_response = response
+                logger.warning(f"[{self._name}] API Key {api_key[:8]}... 搜索失败，尝试下一个 key")
+            except Exception as e:
+                self._record_error(api_key)
+                last_error = e
+                logger.warning(f"[{self._name}] API Key {api_key[:8]}... 搜索异常，尝试下一个 key: {e}")
+
+        elapsed = time.time() - start_time
+        if last_response is not None:
+            last_response.search_time = elapsed
+            return last_response
+
+        if last_error is not None:
+            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {last_error}")
             return SearchResponse(
                 query=query,
                 results=[],
                 provider=self._name,
                 success=False,
-                error_message=str(e),
+                error_message=str(last_error),
                 search_time=elapsed
             )
+
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message=f"{self._name} 没有可用 API Key",
+            search_time=elapsed,
+        )
 
 
 class TavilySearchProvider(BaseSearchProvider):
@@ -565,28 +591,47 @@ class SearchService:
         
         logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
         
-        # 轮流使用不同的搜索引擎
+        # 轮流选择首选搜索引擎，但每个维度都完整尝试后备引擎。
         provider_index = 0
+        available_providers = [p for p in self._providers if p.is_available]
         
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
             
-            provider = available_providers[provider_index % len(available_providers)]
+            start_index = provider_index % len(available_providers)
             provider_index += 1
+            ordered_providers = available_providers[start_index:] + available_providers[:start_index]
             
-            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
-            
-            response = provider.search(dim['query'], max_results=3)
+            response: Optional[SearchResponse] = None
+            for provider in ordered_providers:
+                logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
+                candidate = provider.search(dim['query'], max_results=3)
+                if candidate.success and candidate.results:
+                    response = candidate
+                    break
+
+                if response is None:
+                    response = candidate
+                logger.warning(
+                    f"[情报搜索] {dim['desc']}: {provider.name} 搜索失败或结果为空 - {candidate.error_message}"
+                )
+
+            if response is None:
+                response = SearchResponse(
+                    query=dim['query'],
+                    results=[],
+                    provider="None",
+                    success=False,
+                    error_message="没有可用的搜索引擎",
+                )
             results[dim['name']] = response
             search_count += 1
             
-            if response.success:
+            if response.success and response.results:
                 logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果")
             else:
                 logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
