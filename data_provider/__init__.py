@@ -1,26 +1,29 @@
-# -*- coding: utf-8 -*-
-"""
-===================================
-数据源策略层 - 包初始化
-===================================
+# compatibility shim: legacy package kept for existing imports.
+from __future__ import annotations
 
-本包实现策略模式管理多个数据源，实现：
-1. 统一的数据获取接口
-2. 自动故障切换
-3. 防封禁流控策略
-"""
+import sys
+import types
 
-from .base import BaseFetcher, DataFetcherManager
-from .akshare_fetcher import AkshareFetcher
-from .tushare_fetcher import TushareFetcher
-from .baostock_fetcher import BaostockFetcher
-from .yfinance_fetcher import YfinanceFetcher
+_ALIAS = __name__
+_MODULE = "daily_analysis.data_provider"
+_impl = __import__(_MODULE, fromlist=["*"])
 
-__all__ = [
-    'BaseFetcher',
-    'DataFetcherManager',
-    'AkshareFetcher',
-    'TushareFetcher',
-    'BaostockFetcher',
-    'YfinanceFetcher',
-]
+class _CompatPackage(types.ModuleType):
+    def __getattr__(self, name):
+        return getattr(_impl, name)
+
+    def __setattr__(self, name, value):
+        if name == "__file__":
+            setattr(_impl, name, value)
+            types.ModuleType.__setattr__(self, name, value)
+            return
+        if name.startswith("__") or name in {"_ALIAS", "_MODULE", "_impl"}:
+            types.ModuleType.__setattr__(self, name, value)
+            return
+        setattr(_impl, name, value)
+        types.ModuleType.__setattr__(self, name, value)
+
+sys.modules[_ALIAS].__class__ = _CompatPackage
+for _name, _value in _impl.__dict__.items():
+    if not (_name.startswith("__") and _name.endswith("__")):
+        globals()[_name] = _value
