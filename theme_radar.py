@@ -16,6 +16,9 @@ from theme_tracker import ThemeTracker
 logger = logging.getLogger(__name__)
 
 
+CONFIDENCE_ORDER = {"低": 0, "中": 1, "高": 2}
+
+
 class ThemeRadar:
     """Coordinate market context, evidence, theme discovery, leaders, and history."""
 
@@ -27,17 +30,20 @@ class ThemeRadar:
         daily_fetcher: Any = None,
         trend_analyzer: Any = None,
         analyzer: Any = None,
+        llm_analyzer: Any = None,
         detail_analyzer: Optional[Callable[[str], Any]] = None,
         screener: Any = None,
         capital_flow: Optional[CapitalFlowAdapter] = None,
         tracker: Optional[ThemeTracker] = None,
     ) -> None:
+        if llm_analyzer is None and analyzer is not None:
+            llm_analyzer = analyzer
         self.market_analyzer = market_analyzer
         self.search_service = search_service
         self.sector_fetcher = sector_fetcher
         self.daily_fetcher = daily_fetcher
         self.trend_analyzer = trend_analyzer
-        self.analyzer = analyzer
+        self.llm_analyzer = llm_analyzer
         self.detail_analyzer = detail_analyzer
         self.screener = screener
         self.capital_flow = capital_flow or CapitalFlowAdapter()
@@ -56,10 +62,23 @@ class ThemeRadar:
         sectors = self._get_hot_sectors(theme_count, include_concepts)
         evidence = self._collect_evidence(sectors, lookback_days)
         capital_map = self.capital_flow.collect_for_sectors(sectors, market_environment)
+        data_quality = self._build_data_quality(sectors, capital_map, evidence)
+        market_environment["data_quality"] = data_quality
         theme_dicts = self._discover_theme_dicts(evidence, sectors, market_environment, theme_count)
-        themes = self._build_theme_signals(theme_dicts, sectors, evidence, capital_map)
+        themes = self._build_theme_signals(theme_dicts, sectors, evidence, capital_map, data_quality)
 
-        screening_result = self._screen_hot_sectors(theme_count, leader_top_n, include_concepts)
+        if sectors:
+            screening_result = self._screen_hot_sectors(theme_count, leader_top_n, include_concepts)
+        else:
+            screening_result = ScreeningResult(
+                filtered=[
+                    {
+                        "code": "-",
+                        "name": "候选龙头",
+                        "reasons": ["未生成候选龙头，因为缺少板块成分股/行情验证"],
+                    }
+                ]
+            )
         leaders = self._build_leader_candidates(screening_result, themes, leader_top_n)
         self._attach_leaders(themes, leaders)
 
@@ -97,12 +116,20 @@ class ThemeRadar:
             f"- 市场评分：{env.get('market_score', 'N/A')}",
             f"- 北向资金：{env.get('north_flow', env.get('overview', {}).get('north_flow', 'N/A'))}",
             f"- 板块热度：{env.get('sector_heat_summary', '无')}",
-            "",
-            "## 2. 今日热点主题 Top 3-5",
-            "",
-            "| 排名 | 主题 | 置信度 | 热度分 | 新闻验证 | 资金验证 | 关联板块 | 状态 |",
-            "| --- | --- | --- | ---: | --- | --- | --- | --- |",
         ]
+        data_quality = env.get("data_quality") or {}
+        lines.append(f"- 数据质量：{self._format_data_quality(data_quality)}")
+        if data_quality.get("downgrade_note"):
+            lines.append(f"- 降级说明：{data_quality['downgrade_note']}")
+        lines.extend(
+            [
+                "",
+                "## 2. 今日热点主题 Top 3-5",
+                "",
+                "| 排名 | 主题 | 置信度 | 热度分 | 新闻验证 | 资金验证 | 关联板块 | 状态 |",
+                "| --- | --- | --- | ---: | --- | --- | --- | --- |",
+            ]
+        )
         for index, theme in enumerate(result.themes, start=1):
             lines.append(
                 f"| {index} | {theme.name} | {theme.confidence} | {theme.total_score:.1f} | "
@@ -150,6 +177,8 @@ class ThemeRadar:
                 f"{leader.breakout_score:.1f} | {leader.liquidity_score:.1f} | "
                 f"{'；'.join(leader.risk_flags) or '-'} |"
             )
+        if not result.selected_stocks:
+            lines.append("未生成候选龙头，因为缺少板块成分股或行情验证。")
 
         if result.detailed_results:
             lines.extend(["", "## 5. Top 个股精细报告摘要", ""])
@@ -172,9 +201,44 @@ class ThemeRadar:
         """Reuse StockAnalysisPipeline.analyze_stock or a compatible detail callable."""
         if self.detail_analyzer:
             return self.detail_analyzer(code)
-        if self.analyzer and hasattr(self.analyzer, "analyze_stock"):
-            return self.analyzer.analyze_stock(code)
         return None
+
+    def _build_data_quality(
+        self,
+        sectors: Sequence[Dict[str, Any]],
+        capital_map: Dict[str, CapitalFlowEvidence],
+        evidence: Sequence[ThemeEvidence],
+    ) -> Dict[str, Any]:
+        sector_available = bool(sectors)
+        capital_available = any(self._has_capital_validation(item) for item in (capital_map or {}).values())
+        news_available = bool(evidence)
+        notes = []
+        downgrade_note = ""
+        if not sector_available:
+            notes.append("板块行情缺失")
+            downgrade_note = "板块行情获取失败，本报告仅作为新闻主题观察"
+        if sector_available and not capital_available:
+            notes.append("资金数据缺失")
+            downgrade_note = "资金数据缺失，主题按中性偏保守处理"
+        if not news_available:
+            notes.append("新闻证据缺失")
+        return {
+            "sector_data_available": sector_available,
+            "capital_data_available": capital_available,
+            "news_data_available": news_available,
+            "notes": notes,
+            "downgrade_note": downgrade_note,
+        }
+
+    @staticmethod
+    def _format_data_quality(data_quality: Dict[str, Any]) -> str:
+        if not data_quality:
+            return "未记录"
+        parts = []
+        parts.append("板块行情可用" if data_quality.get("sector_data_available") else "板块行情缺失")
+        parts.append("资金数据可用" if data_quality.get("capital_data_available") else "资金数据缺失")
+        parts.append("新闻证据可用" if data_quality.get("news_data_available") else "新闻证据缺失")
+        return " / ".join(parts)
 
     def _get_market_environment(self) -> Dict[str, Any]:
         if not self.market_analyzer:
@@ -246,11 +310,11 @@ class ThemeRadar:
 
         if self.search_service and getattr(self.search_service, "is_available", False):
             try:
-                response = self.search_service.search_stock_news(
-                    "market",
-                    f"A股热点板块 近{lookback_days}日 政策 产业 资金",
-                    max_results=5,
-                )
+                query = f"A股热点板块 近{lookback_days}日 政策 产业 资金"
+                if hasattr(self.search_service, "search_market_news"):
+                    response = self.search_service.search_market_news(query, max_results=5)
+                else:
+                    response = self.search_service.search_stock_news("market", query, max_results=5)
                 for item in getattr(response, "results", []) or []:
                     idx = len([e for e in evidence if e.id.startswith("news_")]) + 1
                     evidence.append(
@@ -283,12 +347,12 @@ class ThemeRadar:
             theme_count=theme_count,
         )
         response_text = ""
-        if self.analyzer and getattr(self.analyzer, "is_available", lambda: False)():
+        if self.llm_analyzer and getattr(self.llm_analyzer, "is_available", lambda: False)():
             try:
-                if hasattr(self.analyzer, "generate_theme_json"):
-                    response_text = self.analyzer.generate_theme_json(prompt)
-                elif hasattr(self.analyzer, "_call_api_with_retry"):
-                    response_text = self.analyzer._call_api_with_retry(
+                if hasattr(self.llm_analyzer, "generate_theme_json"):
+                    response_text = self.llm_analyzer.generate_theme_json(prompt)
+                elif hasattr(self.llm_analyzer, "_call_api_with_retry"):
+                    response_text = self.llm_analyzer._call_api_with_retry(
                         prompt,
                         {"temperature": 0.2, "max_output_tokens": 2048},
                     )
@@ -339,24 +403,30 @@ class ThemeRadar:
         sectors: Sequence[Dict[str, Any]],
         evidence: Sequence[ThemeEvidence],
         capital_map: Dict[str, CapitalFlowEvidence],
+        data_quality: Optional[Dict[str, Any]] = None,
     ) -> List[ThemeSignal]:
         known_sectors = {str(item.get("name") or ""): item for item in sectors}
         valid_evidence = {item.id for item in evidence}
+        data_quality = data_quality or self._build_data_quality(sectors, capital_map, evidence)
+        sectors_available = bool(data_quality.get("sector_data_available"))
         themes: List[ThemeSignal] = []
         for raw in theme_dicts:
-            requested_sectors = [str(item) for item in raw.get("related_sectors", []) if str(item)]
+            requested_source = raw.get("requested_sectors", raw.get("related_sectors", []))
+            requested_sectors = [str(item) for item in requested_source if str(item)]
             related_sectors = [item for item in requested_sectors if item in known_sectors]
             risks = list(raw.get("risks") or [])
-            if requested_sectors and not related_sectors:
-                risks.append("主题与现有板块映射待确认")
+            downgrade_reasons: List[str] = []
             evidence_ids = [item for item in raw.get("evidence_ids", []) if item in valid_evidence]
             if not evidence_ids:
                 continue
 
             capital_score = 12.5
             capital_observation = "资金数据缺失，按中性处理"
+            flows: List[CapitalFlowEvidence] = []
+            theme_capital_available = False
             if related_sectors:
                 flows = [capital_map[item] for item in related_sectors if item in capital_map]
+                theme_capital_available = any(self._has_capital_validation(flow) for flow in flows)
                 if flows:
                     capital_score = round(sum(flow.score for flow in flows) / len(flows), 2)
                     observations = [flow.observation for flow in flows]
@@ -372,7 +442,47 @@ class ThemeRadar:
             news_score = self._score_news(raw, evidence_ids)
             market_score = self._score_market(related_sectors, known_sectors)
             persistence_score = self._safe_float(raw.get("persistence_score"), 6.0)
-            heat_score = news_score + capital_score + market_score + persistence_score
+            confidence = str(raw.get("confidence") or "中")
+            status = "待确认" if not related_sectors else "新发酵"
+            heat_cap = 100.0
+
+            if not sectors_available:
+                confidence = self._cap_confidence(confidence, "中")
+                status = "待确认"
+                capital_score = 0.0
+                market_score = 0.0
+                heat_cap = 59.0
+                capital_observation = "板块行情/资金数据缺失，本报告仅作为新闻主题观察"
+                self._append_unique(risks, "板块行情获取失败，本报告仅作为新闻主题观察")
+                self._append_unique(downgrade_reasons, "缺少可验证板块行情与资金验证")
+            elif requested_sectors and not related_sectors:
+                confidence = self._cap_confidence(confidence, "中")
+                status = "待确认"
+                capital_score = min(capital_score, 6.0)
+                market_score = min(market_score, 6.0)
+                heat_cap = 64.0
+                self._append_unique(risks, "主题与现有板块映射待确认")
+                self._append_unique(downgrade_reasons, "缺少可验证板块映射")
+            elif not requested_sectors:
+                confidence = self._cap_confidence(confidence, "中")
+                status = "待确认"
+                capital_score = min(capital_score, 6.0)
+                market_score = min(market_score, 6.0)
+                heat_cap = 59.0
+                self._append_unique(risks, "LLM 未提供可验证关联板块")
+                self._append_unique(downgrade_reasons, "缺少可验证关联板块")
+
+            if sectors_available and not theme_capital_available:
+                confidence = self._cap_confidence(confidence, "中")
+                capital_score = min(capital_score, 8.0)
+                if capital_observation == "资金数据缺失，按中性处理":
+                    capital_observation = "资金数据缺失，按中性偏保守处理"
+                self._append_unique(downgrade_reasons, "资金验证缺失")
+
+            heat_score = self._clamp_score(
+                news_score + capital_score + market_score + persistence_score,
+                upper=heat_cap,
+            )
 
             themes.append(
                 ThemeSignal(
@@ -386,10 +496,11 @@ class ThemeRadar:
                     catalysts=list(raw.get("catalysts") or []),
                     risks=risks,
                     evidence_ids=evidence_ids,
-                    confidence=str(raw.get("confidence") or "中"),
+                    confidence=confidence,
                     unsupported_claims=list(raw.get("unsupported_claims") or []),
                     capital_observation=capital_observation,
-                    status="待确认" if not related_sectors else "新发酵",
+                    status=status,
+                    downgrade_reasons=downgrade_reasons,
                 )
             )
         themes.sort(key=lambda item: item.total_score, reverse=True)
@@ -447,8 +558,11 @@ class ThemeRadar:
 
     def _attach_leaders(self, themes: Sequence[ThemeSignal], leaders: Sequence[LeaderCandidate]) -> None:
         for theme in themes:
+            if not theme.related_sectors:
+                theme.leader_candidates = []
+                continue
             matched = [leader for leader in leaders if leader.sector_name in theme.related_sectors]
-            theme.leader_candidates = matched[:3] if matched else list(leaders[:1])
+            theme.leader_candidates = matched[:3]
 
     def _run_detail_analysis(self, leaders: Sequence[LeaderCandidate]) -> List[Any]:
         details = []
@@ -495,6 +609,31 @@ class ThemeRadar:
             change_pct = self._safe_float(sector.get("change_pct"))
             scores.append(max(4.0, min(20.0, 14.0 - max(rank - 1, 0) * 1.5 + max(0.0, change_pct))))
         return round(sum(scores) / len(scores), 2)
+
+    @staticmethod
+    def _cap_confidence(value: str, ceiling: str) -> str:
+        value = str(value or "中")
+        ceiling = str(ceiling or "中")
+        if CONFIDENCE_ORDER.get(value, 1) > CONFIDENCE_ORDER.get(ceiling, 1):
+            return ceiling
+        return value
+
+    @staticmethod
+    def _clamp_score(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
+        return round(max(lower, min(upper, float(value or 0.0))), 2)
+
+    @staticmethod
+    def _append_unique(items: List[str], value: str) -> None:
+        if value and value not in items:
+            items.append(value)
+
+    @staticmethod
+    def _has_capital_validation(flow: CapitalFlowEvidence) -> bool:
+        if not flow:
+            return False
+        observation = str(getattr(flow, "observation", "") or "")
+        missing_fields = list(getattr(flow, "missing_fields", []) or [])
+        return not missing_fields and not observation.startswith("资金数据缺失")
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:

@@ -386,6 +386,31 @@ class SearchService:
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
         return any(p.is_available for p in self._providers)
+
+    def search_market_news(self, query: str, max_results: int = 5) -> SearchResponse:
+        """
+        搜索市场热点、政策、产业和资金主题新闻。
+
+        该接口直接使用调用方提供的主题 query，不追加个股新闻模板。
+        """
+        logger.info(f"搜索市场主题新闻: {query}")
+        for provider in self._providers:
+            if not provider.is_available:
+                continue
+
+            response = provider.search(query, max_results)
+            if response.success and response.results:
+                logger.info(f"使用 {provider.name} 搜索市场主题成功")
+                return response
+            logger.warning(f"{provider.name} 市场主题搜索失败: {response.error_message}，尝试下一个引擎")
+
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider="None",
+            success=False,
+            error_message="所有搜索引擎都不可用或市场主题搜索失败",
+        )
     
     def search_stock_news(
         self,

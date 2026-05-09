@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -22,6 +23,7 @@ class ThemeBacktestSummary:
     leader_returns: Dict[str, float] = field(default_factory=dict)
     win_rates: Dict[str, float] = field(default_factory=dict)
     factor_effectiveness: Dict[str, float] = field(default_factory=dict)
+    return_source_counts: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -32,6 +34,7 @@ class ThemeBacktestSummary:
             "leader_returns": self.leader_returns,
             "win_rates": self.win_rates,
             "factor_effectiveness": self.factor_effectiveness,
+            "return_source_counts": self.return_source_counts,
         }
 
 
@@ -47,7 +50,17 @@ class ThemeBacktestResult:
 class ThemeBacktester:
     """Evaluate saved radar themes and leaders with simple forward returns."""
 
-    def __init__(self, horizons: Sequence[int] = DEFAULT_HORIZONS) -> None:
+    def __init__(
+        self,
+        sector_fetcher: Any = None,
+        daily_fetcher: Any = None,
+        horizons: Sequence[int] = DEFAULT_HORIZONS,
+    ) -> None:
+        if daily_fetcher is None and horizons == DEFAULT_HORIZONS and self._looks_like_horizons(sector_fetcher):
+            horizons = sector_fetcher
+            sector_fetcher = None
+        self.sector_fetcher = sector_fetcher
+        self.daily_fetcher = daily_fetcher
         self.horizons = tuple(horizons)
 
     def run_backtest(self, records: str | Path | Iterable[Dict[str, Any]]) -> ThemeBacktestResult:
@@ -60,6 +73,13 @@ class ThemeBacktester:
             for theme in record.get("themes", []):
                 if not isinstance(theme, dict):
                     continue
+                theme_returns = self._extract_horizon_returns(theme, "sector_forward_returns")
+                return_source = "history_fields" if theme_returns else "missing"
+                if not theme_returns:
+                    theme_returns = self._supplement_theme_returns(theme, generated_at)
+                    if theme_returns:
+                        return_source = "market_supplement"
+
                 row = {
                     "generated_at": generated_at,
                     "theme": theme.get("name", ""),
@@ -69,15 +89,22 @@ class ThemeBacktester:
                     "market_score": float(theme.get("market_score") or 0),
                     "persistence_score": float(theme.get("persistence_score") or 0),
                     "confidence": theme.get("confidence", ""),
-                    "theme_forward_returns": self._extract_horizon_returns(theme, "sector_forward_returns"),
+                    "theme_forward_returns": theme_returns,
+                    "return_source": return_source,
                     "leader_forward_returns": [],
+                    "leader_return_sources": [],
                 }
                 for leader in theme.get("leader_candidates") or []:
                     if isinstance(leader, dict):
                         leader_count += 1
-                        row["leader_forward_returns"].append(
-                            self._extract_horizon_returns(leader, "leader_forward_returns")
-                        )
+                        leader_returns = self._extract_horizon_returns(leader, "leader_forward_returns")
+                        leader_source = "history_fields" if leader_returns else "missing"
+                        if not leader_returns:
+                            leader_returns = self._supplement_leader_returns(leader, generated_at)
+                            if leader_returns:
+                                leader_source = "market_supplement"
+                        row["leader_forward_returns"].append(leader_returns)
+                        row["leader_return_sources"].append(leader_source)
                 rows.append(row)
 
         summary = self._build_summary(rows, leader_count)
@@ -90,6 +117,7 @@ class ThemeBacktester:
             "",
             f"- 主题样本数：{summary.theme_count}",
             f"- 龙头样本数：{summary.leader_count}",
+            f"- 收益来源：{self._format_source_counts(summary.return_source_counts)}",
             "",
             "## 主题收益",
             "",
@@ -129,6 +157,10 @@ class ThemeBacktester:
             win_rates[key] = round(sum(1 for value in theme_values if value > 0) / len(theme_values) * 100, 2) if theme_values else 0.0
 
         factor_effectiveness = self._factor_effectiveness(rows)
+        source_counts: Dict[str, int] = {}
+        for row in rows:
+            source = str(row.get("return_source") or "missing")
+            source_counts[source] = source_counts.get(source, 0) + 1
         return ThemeBacktestSummary(
             theme_count=len(rows),
             leader_count=leader_count,
@@ -137,6 +169,7 @@ class ThemeBacktester:
             leader_returns=leader_returns,
             win_rates=win_rates,
             factor_effectiveness=factor_effectiveness,
+            return_source_counts=source_counts,
         )
 
     def _factor_effectiveness(self, rows: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -171,6 +204,159 @@ class ThemeBacktester:
             if value is not None:
                 result[key] = float(value)
         return result
+
+    def _supplement_theme_returns(self, theme: Dict[str, Any], generated_at: str) -> Dict[str, float]:
+        if not self.sector_fetcher:
+            return {}
+        sector_names = [str(item) for item in theme.get("related_sectors") or [] if str(item)]
+        if not sector_names:
+            return {}
+        data = self._call_fetcher(
+            self.sector_fetcher,
+            ("get_sector_daily_data", "get_daily_data"),
+            sector_names[0],
+        )
+        return self._calculate_forward_returns(data, generated_at)
+
+    def _supplement_leader_returns(self, leader: Dict[str, Any], generated_at: str) -> Dict[str, float]:
+        if not self.daily_fetcher:
+            return {}
+        code = str(leader.get("code") or leader.get("stock_code") or "")
+        if not code:
+            return {}
+        data = self._call_fetcher(
+            self.daily_fetcher,
+            ("get_daily_data", "get_stock_daily_data"),
+            code,
+        )
+        return self._calculate_forward_returns(data, generated_at)
+
+    def _call_fetcher(self, fetcher: Any, method_names: Sequence[str], key: str) -> Any:
+        for method_name in method_names:
+            method = getattr(fetcher, method_name, None)
+            if not method:
+                continue
+            try:
+                return method(key, days=max(self.horizons) + 30)
+            except TypeError:
+                try:
+                    return method(key)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+        return None
+
+    def _calculate_forward_returns(self, data: Any, generated_at: str) -> Dict[str, float]:
+        rows = self._normalize_price_rows(data)
+        if not rows:
+            return {}
+        generated_date = self._parse_date(generated_at)
+        base_index = self._find_base_index(rows, generated_date)
+        if base_index is None:
+            return {}
+        base_close = rows[base_index]["close"]
+        if base_close <= 0:
+            return {}
+        returns: Dict[str, float] = {}
+        for horizon in self.horizons:
+            target_index = base_index + horizon
+            if target_index < len(rows):
+                target_close = rows[target_index]["close"]
+                returns[f"{horizon}d"] = round((target_close / base_close - 1.0) * 100.0, 2)
+        return returns
+
+    def _normalize_price_rows(self, data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, tuple):
+            data = data[0] if data else None
+        if data is None:
+            return []
+        if hasattr(data, "empty") and getattr(data, "empty"):
+            return []
+        if hasattr(data, "to_dict"):
+            records = data.to_dict("records")
+        elif isinstance(data, dict):
+            records = data.get("data") or data.get("records") or []
+        else:
+            records = list(data or [])
+
+        rows: List[Dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            close = self._first_present_float(item, ("close", "收盘", "收盘价", "Close"))
+            row_date = self._parse_date(
+                item.get("date")
+                or item.get("trade_date")
+                or item.get("datetime")
+                or item.get("日期")
+            )
+            if close is not None:
+                rows.append({"date": row_date, "close": close})
+        rows.sort(key=lambda item: item["date"] or date.min)
+        return rows
+
+    @staticmethod
+    def _find_base_index(rows: Sequence[Dict[str, Any]], generated_date: Optional[date]) -> Optional[int]:
+        if not rows:
+            return None
+        if generated_date is None:
+            return 0
+        dated_indexes = [(idx, row["date"]) for idx, row in enumerate(rows) if row.get("date") is not None]
+        if not dated_indexes:
+            return 0
+        for idx, row_date in dated_indexes:
+            if row_date >= generated_date:
+                return idx
+        return None
+
+    @staticmethod
+    def _parse_date(value: Any) -> Optional[date]:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text[:10] if "-" in text else text[:8]
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _first_present_float(item: Dict[str, Any], keys: Sequence[str]) -> Optional[float]:
+        for key in keys:
+            if key not in item:
+                continue
+            try:
+                value = item[key]
+                if isinstance(value, str):
+                    value = value.replace(",", "").strip()
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _format_source_counts(source_counts: Dict[str, int]) -> str:
+        labels = {
+            "history_fields": "历史字段读取",
+            "market_supplement": "真实行情补算",
+            "missing": "样本行情不足",
+        }
+        if not source_counts:
+            return "样本行情不足"
+        return " / ".join(f"{labels.get(key, key)} {value}" for key, value in source_counts.items())
+
+    @staticmethod
+    def _looks_like_horizons(value: Any) -> bool:
+        return isinstance(value, (list, tuple)) and all(isinstance(item, int) for item in value)
 
     @staticmethod
     def _simple_slope(values: Sequence[float], target: Sequence[float]) -> float:

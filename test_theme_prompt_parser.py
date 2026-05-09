@@ -50,3 +50,27 @@ def test_parse_theme_discovery_response_filters_unbacked_themes_and_downgrades()
     assert parsed[0]["related_sectors"] == ["AI应用"]
     assert parsed[0]["evidence_ids"] == ["news_001"]
     assert "unsupported_claims" in parsed[0]["risks"][0]
+
+
+def test_parse_theme_discovery_response_preserves_unmapped_requested_sectors():
+    response = """
+    {
+      "themes": [
+        {
+          "name": "映射失败主题",
+          "confidence": "高",
+          "related_sectors": ["不存在板块"],
+          "catalysts": ["政策"],
+          "risks": [],
+          "evidence_ids": ["news_001"],
+          "unsupported_claims": []
+        }
+      ]
+    }
+    """
+
+    parsed = parse_theme_discovery_response(response, {"news_001"}, ["AI应用"])
+
+    assert parsed[0]["related_sectors"] == []
+    assert parsed[0]["requested_sectors"] == ["不存在板块"]
+    assert "主题与现有板块映射待确认" in parsed[0]["risks"]

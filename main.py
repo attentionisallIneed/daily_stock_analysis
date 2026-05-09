@@ -926,7 +926,7 @@ class StockAnalysisPipeline:
             sector_fetcher=self.akshare_fetcher,
             daily_fetcher=self.fetcher_manager,
             trend_analyzer=self.trend_analyzer,
-            analyzer=self.analyzer,
+            llm_analyzer=self.analyzer,
             detail_analyzer=lambda code: self.process_single_stock(code, skip_analysis=False),
         )
         result = radar.run(
@@ -1101,7 +1101,13 @@ def parse_arguments() -> argparse.Namespace:
         '--theme-include-concepts',
         action='store_true',
         default=True,
-        help='热点主题雷达包含概念板块，默认启用'
+        help='热点主题雷达包含概念板块，默认已启用'
+    )
+
+    parser.add_argument(
+        '--theme-no-concepts',
+        action='store_true',
+        help='热点主题雷达不包含概念板块'
     )
 
     parser.add_argument(
@@ -1307,7 +1313,7 @@ def main() -> int:
                 leader_top_n=args.theme_top_n,
                 lookback_days=args.theme_lookback_days,
                 include_detail_analysis=not args.theme_no_llm_detail and not args.dry_run,
-                include_concepts=args.theme_include_concepts,
+                include_concepts=not getattr(args, "theme_no_concepts", False),
                 send_notification=not args.no_notify,
             )
             return 0

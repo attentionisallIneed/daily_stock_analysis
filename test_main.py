@@ -886,6 +886,73 @@ def test_parse_arguments_handles_common_modes(monkeypatch):
     assert args.screen_no_llm is True
 
 
+def test_theme_no_concepts_cli_argument(monkeypatch):
+    monkeypatch.setattr(
+        main_module.sys,
+        "argv",
+        [
+            "main.py",
+            "--theme-radar",
+            "--theme-no-concepts",
+            "--theme-no-llm-detail",
+        ],
+    )
+
+    args = main_module.parse_arguments()
+
+    assert args.theme_radar is True
+    assert args.theme_include_concepts is True
+    assert args.theme_no_concepts is True
+
+
+def test_main_dispatches_theme_no_concepts(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        debug=False,
+        dry_run=True,
+        stocks=None,
+        no_notify=True,
+        workers=2,
+        theme_radar=True,
+        theme_count=2,
+        theme_top_n=1,
+        theme_lookback_days=3,
+        theme_no_llm_detail=True,
+        theme_no_concepts=True,
+        theme_backtest=False,
+        screen_hot_sectors=False,
+        screen_top_n=2,
+        screen_sector_count=4,
+        screen_no_llm=False,
+        market_review=False,
+        schedule=False,
+        no_market_review=False,
+    )
+    config = SimpleNamespace(log_dir="logs", validate=lambda: [])
+
+    class FakePipeline:
+        def __init__(self, config, max_workers=None):
+            calls.append(("pipeline", max_workers))
+
+        def run_theme_radar(self, **kwargs):
+            calls.append(("theme", kwargs))
+
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: args)
+    monkeypatch.setattr(main_module, "get_config", lambda: config)
+    monkeypatch.setattr(main_module, "setup_logging", lambda debug=False, log_dir="": None)
+    monkeypatch.setattr(main_module, "StockAnalysisPipeline", FakePipeline)
+
+    assert main_module.main() == 0
+    assert ("theme", {
+        "theme_count": 2,
+        "leader_top_n": 1,
+        "lookback_days": 3,
+        "include_detail_analysis": False,
+        "include_concepts": False,
+        "send_notification": False,
+    }) in calls
+
+
 def test_run_full_analysis_delegates_pipeline_market_review_and_feishu(monkeypatch):
     calls = []
     result = SimpleNamespace(

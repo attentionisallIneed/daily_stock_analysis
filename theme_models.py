@@ -64,13 +64,11 @@ class ThemeSignal:
 
     @property
     def total_score(self) -> float:
-        return round(
-            float(self.news_score)
-            + float(self.capital_score)
-            + float(self.market_score)
-            + float(self.persistence_score),
-            2,
-        )
+        try:
+            score = float(self.heat_score or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        return round(max(0.0, min(100.0, score)), 2)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

@@ -182,6 +182,11 @@ def test_search_service_uses_first_successful_provider_and_formats_reports():
     assert failing.calls
     assert succeeding.calls
 
+    market_response = service.search_market_news("A股热点板块 政策 产业", max_results=2)
+    assert market_response.success is True
+    assert succeeding.calls[-1][0] == "A股热点板块 政策 产业"
+    assert "股票 最新消息" not in succeeding.calls[-1][0]
+
     report = service.format_intel_report(
         {
             "latest_news": response,

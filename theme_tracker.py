@@ -27,8 +27,14 @@ def classify_theme_status(
     leader_count = len(current_theme.get("leader_candidates") or [])
     name = str(current_theme.get("name") or "")
     matched = [item for item in previous if str(item.get("name") or "") == name]
+    existing_status = str(current_theme.get("status") or "")
+    existing_downgrades = list(current_theme.get("downgrade_reasons") or [])
 
-    if not matched:
+    if existing_status == STATUS_PENDING and existing_downgrades:
+        status = STATUS_PENDING
+        reason = "数据验证不足，保持待确认"
+        consecutive_days = 1
+    elif not matched:
         status = STATUS_NEW if heat_score >= 50 else STATUS_PENDING
         reason = "首次出现或历史记录为空"
         consecutive_days = 1

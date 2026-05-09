@@ -120,9 +120,13 @@ def parse_theme_discovery_response(
             if not normalized["evidence_ids"]:
                 continue
         if fallback_sector_set:
+            requested_sectors = list(normalized["related_sectors"])
             normalized["related_sectors"] = [
                 item for item in normalized["related_sectors"] if item in fallback_sector_set
             ]
+            if requested_sectors and not normalized["related_sectors"]:
+                normalized["requested_sectors"] = requested_sectors
+                normalized["risks"].append("主题与现有板块映射待确认")
         if normalized["unsupported_claims"] and normalized["confidence"] == "高":
             normalized["confidence"] = "中"
             normalized["risks"].append("存在 unsupported_claims，自动降低置信度")
