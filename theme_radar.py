@@ -300,7 +300,7 @@ class ThemeRadar:
                     source="sector_rank",
                     title=f"{name} 板块异动",
                     summary=(
-                        f"涨跌幅 {sector.get('change_pct', 0)}%，成交额 {sector.get('amount', 0)}，"
+                        f"涨跌幅 {sector.get('change_pct', 0)}%，成交额 {self._format_amount(sector.get('amount'))}，"
                         f"领涨股 {sector.get('leading_stock', '') or '未提供'}"
                     ),
                     related_sectors=[name] if name else [],
@@ -520,6 +520,7 @@ class ThemeRadar:
                 sector_count=max(1, theme_count),
                 top_n=max(1, leader_top_n),
                 include_concepts=include_concepts,
+                prefer_leading_stocks=True,
             )
         except TypeError:
             return screener.screen_hot_sectors(sector_count=max(1, theme_count), top_n=max(1, leader_top_n))
@@ -647,3 +648,14 @@ class ThemeRadar:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @classmethod
+    def _format_amount(cls, value: Any) -> str:
+        amount = cls._safe_float(value)
+        if amount <= 0:
+            return "未知"
+        if amount >= 100_000_000:
+            return f"{amount / 100_000_000:.2f}亿"
+        if amount >= 10_000:
+            return f"{amount / 10_000:.2f}万"
+        return f"{amount:.2f}亿"

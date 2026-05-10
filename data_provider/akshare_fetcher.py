@@ -187,7 +187,9 @@ USER_AGENTS = [
 _realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
-    'ttl': 60  # 60秒缓存有效期
+    'ttl': 60,  # 60秒缓存有效期
+    'failure_timestamp': 0,
+    'failure_ttl': 300,
 }
 
 # ETF 实时行情缓存
@@ -579,6 +581,29 @@ class AkshareFetcher(BaseFetcher):
         sectors.sort(key=lambda item: item.get("change_pct", 0.0), reverse=True)
         return sectors[: max(1, sector_count)]
 
+    def resolve_stock_code_by_name(self, stock_name: str) -> str:
+        """按股票名称查找 A 股代码，用于板块领涨股兜底。"""
+        target = str(stock_name or "").replace(" ", "").strip()
+        if not target:
+            return ""
+
+        cache = getattr(self, "_stock_code_name_cache", None)
+        if cache is None:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            with self._without_proxy():
+                df = self._fetch_with_retry("ak.stock_info_a_code_name", ak.stock_info_a_code_name)
+            cache = {}
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    code = str(row.get("code") or row.get("代码") or "").strip()
+                    name = str(row.get("name") or row.get("名称") or "").replace(" ", "").strip()
+                    if code and name:
+                        cache[name] = code
+            self._stock_code_name_cache = cache
+
+        return str(cache.get(target) or "")
+
     def get_sector_constituents(self, sector_name: str, sector_type: str = "industry") -> List[Dict[str, Any]]:
         """获取行业/概念板块成分股。"""
         fetch_func = ak.stock_board_concept_cons_em if sector_type == "concept" else ak.stock_board_industry_cons_em
@@ -857,6 +882,9 @@ class AkshareFetcher(BaseFetcher):
                 current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
                 df = _realtime_cache['data']
                 logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据")
+            elif current_time - _realtime_cache.get('failure_timestamp', 0) < _realtime_cache.get('failure_ttl', 300):
+                logger.warning("[实时行情] A股实时行情接口处于失败冷却期，跳过本次获取")
+                return None
             else:
                 # 防封禁策略
                 self._set_random_user_agent()
@@ -877,6 +905,9 @@ class AkshareFetcher(BaseFetcher):
                 _realtime_cache['timestamp'] = current_time
             
             # 查找指定股票
+            if df is None or df.empty or '代码' not in df.columns:
+                logger.warning(f"[API返回] 实时行情数据为空，无法查找 {stock_code}")
+                return None
             row = df[df['代码'] == stock_code]
             if row.empty:
                 logger.warning(f"[API返回] 未找到股票 {stock_code} 的实时行情")
@@ -918,6 +949,8 @@ class AkshareFetcher(BaseFetcher):
             
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 实时行情失败: {e}")
+            _realtime_cache['data'] = None
+            _realtime_cache['failure_timestamp'] = time.time()
             return None
     
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:

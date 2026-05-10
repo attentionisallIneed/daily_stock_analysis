@@ -29,5 +29,5 @@ def test_capital_flow_normalizes_source_update_reliability_and_scores():
     assert strong.reliability == "high"
     assert strong.score > weak.score
     assert strong.observation in {"新闻与资金共振", "资金强、新闻待确认"}
-    assert weak.missing_fields == ["amount", "turnover_rate"]
+    assert weak.missing_fields == ["capital_snapshot"]
     assert weak.observation == "资金数据缺失，按中性处理"

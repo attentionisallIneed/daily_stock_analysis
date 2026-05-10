@@ -18,6 +18,8 @@ import logging
 import json
 import smtplib
 import re
+import html
+import unicodedata
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from email.mime.text import MIMEText
@@ -1504,7 +1506,7 @@ class NotificationService:
         {
             "chat_id": "xxx",
             "text": "消息内容",
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         }
         
         Args:
@@ -1524,8 +1526,8 @@ class NotificationService:
             # Telegram API 端点
             api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             
-            # Telegram 消息最大长度 4096 字符
-            max_length = 4096
+            # Telegram 消息最大长度 4096 字符；预留 HTML 转义和标签空间
+            max_length = 3200
             
             if len(content) <= max_length:
                 # 单条消息发送
@@ -1542,14 +1544,12 @@ class NotificationService:
     
     def _send_telegram_message(self, api_url: str, chat_id: str, text: str) -> bool:
         """发送单条 Telegram 消息"""
-        # 转换 Markdown 为 Telegram 支持的格式
-        # Telegram 的 Markdown 格式稍有不同，做简单处理
-        telegram_text = self._convert_to_telegram_markdown(text)
+        telegram_text = self._convert_to_telegram_html(text)
         
         payload = {
             "chat_id": chat_id,
             "text": telegram_text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         
@@ -1580,45 +1580,182 @@ class NotificationService:
         else:
             logger.error(f"Telegram 请求失败: HTTP {response.status_code}")
             logger.error(f"响应内容: {response.text}")
+            if self._is_telegram_parse_error(response.text):
+                logger.info("尝试使用纯文本格式重新发送...")
+                plain_payload = {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                }
+                retry_response = requests.post(api_url, json=plain_payload, timeout=10)
+                if retry_response.status_code == 200 and retry_response.json().get('ok'):
+                    logger.info("Telegram 消息发送成功（纯文本）")
+                    return True
+                logger.error(f"Telegram 纯文本重试失败: HTTP {retry_response.status_code}")
+                logger.error(f"响应内容: {retry_response.text}")
             return False
+
+    @staticmethod
+    def _is_telegram_parse_error(response_text: str) -> bool:
+        lowered = str(response_text or "").lower()
+        return "parse" in lowered or "can't parse entities" in lowered or "markdown" in lowered
     
     def _send_telegram_chunked(self, api_url: str, chat_id: str, content: str, max_length: int) -> bool:
         """分段发送长 Telegram 消息"""
-        # 按段落分割
-        sections = content.split("\n---\n")
-        
-        current_chunk = []
-        current_length = 0
         all_success = True
-        chunk_index = 1
-        
-        for section in sections:
-            section_length = len(section) + 5  # +5 for "\n---\n"
-            
-            if current_length + section_length > max_length:
-                # 发送当前块
-                if current_chunk:
-                    chunk_content = "\n---\n".join(current_chunk)
-                    logger.info(f"发送 Telegram 消息块 {chunk_index}...")
-                    if not self._send_telegram_message(api_url, chat_id, chunk_content):
-                        all_success = False
-                    chunk_index += 1
-                
-                # 重置
-                current_chunk = [section]
-                current_length = section_length
-            else:
-                current_chunk.append(section)
-                current_length += section_length
-        
-        # 发送最后一块
-        if current_chunk:
-            chunk_content = "\n---\n".join(current_chunk)
-            logger.info(f"发送 Telegram 消息块 {chunk_index}（最后）...")
+        chunks = self._split_telegram_chunks(content, max_length)
+        for chunk_index, chunk_content in enumerate(chunks, start=1):
+            suffix = "（最后）" if chunk_index == len(chunks) else ""
+            logger.info(f"发送 Telegram 消息块 {chunk_index}{suffix}...")
             if not self._send_telegram_message(api_url, chat_id, chunk_content):
                 all_success = False
         
         return all_success
+
+    def _split_telegram_chunks(self, content: str, max_length: int) -> List[str]:
+        """按行分割 Telegram 长消息，避免超长消息或拆断多数 Markdown 表格。"""
+        chunks: List[str] = []
+        current = ""
+        for line in content.splitlines(keepends=True):
+            if len(line) > max_length:
+                if current:
+                    chunks.append(current.rstrip())
+                    current = ""
+                for start in range(0, len(line), max_length):
+                    chunks.append(line[start:start + max_length].rstrip())
+                continue
+
+            if current and len(current) + len(line) > max_length:
+                chunks.append(current.rstrip())
+                current = line
+            else:
+                current += line
+
+        if current.strip():
+            chunks.append(current.rstrip())
+        return chunks or [content[:max_length]]
+
+    def _convert_to_telegram_html(self, text: str) -> str:
+        """转换为 Telegram HTML，并将 Markdown 表格转成固定列宽的 pre 块。"""
+        lines = text.splitlines()
+        output: List[str] = []
+        table_lines: List[str] = []
+
+        def flush_table() -> None:
+            if table_lines:
+                table_text = self._format_markdown_table_for_telegram(table_lines)
+                output.append("<pre>" + html.escape(table_text, quote=False) + "</pre>")
+                table_lines.clear()
+
+        for line in lines:
+            if self._is_markdown_table_line(line):
+                table_lines.append(line)
+                continue
+
+            flush_table()
+            output.append(self._convert_non_table_line_to_html(line))
+
+        flush_table()
+        return "\n".join(output)
+
+    @staticmethod
+    def _is_markdown_table_line(line: str) -> bool:
+        stripped = line.strip()
+        return bool(stripped.startswith("|") and "|" in stripped[1:])
+
+    @classmethod
+    def _format_markdown_table_for_telegram(cls, table_lines: List[str]) -> str:
+        rows = []
+        for line in table_lines:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if not cells or cls._is_markdown_separator_row(cells):
+                continue
+            rows.append([cls._strip_markdown_inline(cell) for cell in cells])
+
+        if not rows:
+            return "\n".join(table_lines)
+
+        col_count = max(len(row) for row in rows)
+        normalized = [row + [""] * (col_count - len(row)) for row in rows]
+        caps = cls._telegram_column_caps(col_count)
+        widths = []
+        for index in range(col_count):
+            content_width = max(cls._display_width(row[index]) for row in normalized)
+            widths.append(max(3, min(content_width, caps[index])))
+
+        formatted = []
+        for row_index, row in enumerate(normalized):
+            cells = []
+            for index, cell in enumerate(row):
+                clipped = cls._truncate_display(cell, widths[index])
+                cells.append(cls._pad_display(clipped, widths[index]))
+            formatted.append("  ".join(cells).rstrip())
+            if row_index == 0 and len(normalized) > 1:
+                formatted.append("  ".join("-" * width for width in widths).rstrip())
+        return "\n".join(formatted)
+
+    @staticmethod
+    def _is_markdown_separator_row(cells: List[str]) -> bool:
+        return all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells if cell.strip())
+
+    @staticmethod
+    def _strip_markdown_inline(text: str) -> str:
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"`(.+?)`", r"\1", text)
+        return text
+
+    @staticmethod
+    def _telegram_column_caps(col_count: int) -> List[int]:
+        if col_count >= 10:
+            return [4, 6, 8, 12, 8, 6, 5, 5, 6, 22] + [12] * (col_count - 10)
+        if col_count >= 8:
+            return [4, 12, 6, 6, 8, 10, 12, 16] + [12] * (col_count - 8)
+        if col_count >= 6:
+            return [6, 10, 10, 8, 16, 20] + [12] * (col_count - 6)
+        return [8, 14, 14, 14, 18][:col_count] + [12] * max(0, col_count - 5)
+
+    @staticmethod
+    def _display_width(text: str) -> int:
+        width = 0
+        for char in str(text or ""):
+            if unicodedata.combining(char):
+                continue
+            width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        return width
+
+    @classmethod
+    def _truncate_display(cls, text: str, max_width: int) -> str:
+        text = str(text or "")
+        if cls._display_width(text) <= max_width:
+            return text
+        suffix = "..."
+        suffix_width = cls._display_width(suffix)
+        target = max(0, max_width - suffix_width)
+        current = 0
+        chars = []
+        for char in text:
+            char_width = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1)
+            if current + char_width > target:
+                break
+            chars.append(char)
+            current += char_width
+        return "".join(chars).rstrip() + suffix
+
+    @classmethod
+    def _pad_display(cls, text: str, width: int) -> str:
+        return text + " " * max(0, width - cls._display_width(text))
+
+    @staticmethod
+    def _convert_non_table_line_to_html(line: str) -> str:
+        if not line:
+            return ""
+        stripped = line.strip()
+        heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading:
+            return f"<b>{html.escape(heading.group(2), quote=False)}</b>"
+
+        escaped = html.escape(line, quote=False)
+        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
     
     def _convert_to_telegram_markdown(self, text: str) -> str:
         """

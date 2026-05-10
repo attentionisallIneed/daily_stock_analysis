@@ -15,7 +15,7 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -88,6 +88,26 @@ class YfinanceFetcher(BaseFetcher):
         else:
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
+
+    def _convert_index_code(self, index_code: str) -> str:
+        """转换 A 股指数代码为 Yahoo Finance 格式。"""
+        code = str(index_code or "").strip()
+        if ".SS" in code.upper() or ".SZ" in code.upper():
+            return code.upper()
+        code = code.replace(".SH", "").replace(".SZ", "").replace(".sh", "").replace(".sz", "")
+        index_map = {
+            "000001": "000001.SS",
+            "000016": "000016.SS",
+            "000300": "000300.SS",
+            "000688": "000688.SS",
+            "399001": "399001.SZ",
+            "399006": "399006.SZ",
+        }
+        if code in index_map:
+            return index_map[code]
+        if code.startswith("399"):
+            return f"{code}.SZ"
+        return f"{code}.SS"
     
     @retry(
         stop=stop_after_attempt(3),
@@ -183,6 +203,41 @@ class YfinanceFetcher(BaseFetcher):
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         
+        return df
+
+    def get_index_daily_data(
+        self,
+        index_code: str = "000300",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 250,
+    ) -> pd.DataFrame:
+        """获取指数日线数据，用作相对强弱基准。"""
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
+            start_date = start_dt.strftime("%Y-%m-%d")
+
+        import yfinance as yf
+
+        yf_code = self._convert_index_code(index_code)
+        logger.info(f"[YfinanceFetcher] 获取指数 {index_code} 数据: {start_date} ~ {end_date}")
+        raw_df = yf.download(
+            tickers=yf_code,
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=True,
+        )
+
+        if raw_df is None or raw_df.empty:
+            raise DataFetchError(f"Yahoo Finance 未查询到指数 {index_code} 的数据")
+
+        df = self._normalize_data(raw_df, index_code)
+        df = self._clean_data(df)
+        df = self._calculate_indicators(df)
+        logger.info(f"[YfinanceFetcher] 指数 {index_code} 获取成功，共 {len(df)} 条数据")
         return df
 
     @staticmethod

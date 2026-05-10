@@ -153,6 +153,7 @@ def test_market_analyzer_searches_market_news_with_service():
 
 def test_market_overview_orchestrates_collection_steps(monkeypatch):
     analyzer = MarketAnalyzer(search_service=None, analyzer=None)
+    analyzer.config.market_breadth_enabled = True
     calls = []
 
     monkeypatch.setattr(

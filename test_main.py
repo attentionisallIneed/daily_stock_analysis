@@ -721,8 +721,16 @@ def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
             "debug": False,
             "dry_run": False,
             "stocks": "000001, 600519",
+            "watchlist": False,
             "no_notify": False,
             "workers": 2,
+            "theme_radar": False,
+            "theme_count": 5,
+            "theme_top_n": 3,
+            "theme_lookback_days": 7,
+            "theme_no_llm_detail": False,
+            "theme_no_concepts": False,
+            "theme_backtest": False,
             "screen_hot_sectors": False,
             "screen_top_n": 2,
             "screen_sector_count": 4,
@@ -752,13 +760,22 @@ def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
     monkeypatch.setattr(main_module, "setup_logging", lambda debug=False, log_dir="": calls.append(("logging", debug, log_dir)))
     monkeypatch.setattr(
         main_module,
-        "run_full_analysis",
-        lambda config_arg, args_arg, stock_codes=None: calls.append(("full", args_arg.schedule, stock_codes)),
+        "run_watchlist_analysis",
+        lambda config_arg, args_arg, stock_codes=None: calls.append(("watchlist", args_arg.schedule, stock_codes)),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "run_main_pipeline",
+        lambda config_arg, args_arg: calls.append(("main-pipeline", args_arg.schedule)),
     )
 
     monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
     assert main_module.main() == 0
-    assert ("full", False, ["000001", "600519"]) in calls
+    assert ("watchlist", False, ["000001", "600519"]) in calls
+
+    monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args(stocks=None))
+    assert main_module.main() == 0
+    assert ("main-pipeline", False) in calls
 
     class FakePipeline:
         def __init__(self, config, max_workers=None):
@@ -797,11 +814,11 @@ def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
     monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args(schedule=True))
     assert main_module.main() == 0
     assert ("schedule", "09:30", True) in calls
-    assert ("full", True, ["000001", "600519"]) in calls
+    assert ("watchlist", True, ["000001", "600519"]) in calls
 
     monkeypatch.setattr(
         main_module,
-        "run_full_analysis",
+        "run_watchlist_analysis",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
     monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
@@ -809,7 +826,7 @@ def test_main_dispatches_normal_screen_market_and_schedule_modes(monkeypatch):
 
     monkeypatch.setattr(
         main_module,
-        "run_full_analysis",
+        "run_watchlist_analysis",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fatal")),
     )
     monkeypatch.setattr(main_module, "parse_arguments", lambda: make_args())
@@ -861,6 +878,7 @@ def test_parse_arguments_handles_common_modes(monkeypatch):
             "--dry-run",
             "--stocks",
             "000001,600519",
+            "--watchlist",
             "--no-notify",
             "--workers",
             "3",
@@ -878,6 +896,7 @@ def test_parse_arguments_handles_common_modes(monkeypatch):
     assert args.debug is True
     assert args.dry_run is True
     assert args.stocks == "000001,600519"
+    assert args.watchlist is True
     assert args.no_notify is True
     assert args.workers == 3
     assert args.screen_hot_sectors is True
@@ -953,7 +972,7 @@ def test_main_dispatches_theme_no_concepts(monkeypatch):
     }) in calls
 
 
-def test_run_full_analysis_delegates_pipeline_market_review_and_feishu(monkeypatch):
+def test_run_watchlist_analysis_delegates_pipeline_market_review_and_feishu(monkeypatch):
     calls = []
     result = SimpleNamespace(
         code="000001",
@@ -1005,7 +1024,7 @@ def test_run_full_analysis_delegates_pipeline_market_review_and_feishu(monkeypat
     config = SimpleNamespace(market_review_enabled=True, email_receivers=["admin@example.com"])
     args = SimpleNamespace(workers=2, dry_run=False, no_notify=False, no_market_review=False)
 
-    main_module.run_full_analysis(config, args, stock_codes=["000001"])
+    main_module.run_watchlist_analysis(config, args, stock_codes=["000001"])
 
     assert ("pipeline", 2) in calls
     assert ("run", ["000001"], False, True) in calls
@@ -1013,7 +1032,7 @@ def test_run_full_analysis_delegates_pipeline_market_review_and_feishu(monkeypat
     assert any(call[0] == "feishu" and "market report" in call[2] for call in calls)
 
 
-def test_run_full_analysis_handles_feishu_and_pipeline_exceptions(monkeypatch):
+def test_run_watchlist_analysis_handles_feishu_and_pipeline_exceptions(monkeypatch):
     calls = []
 
     class FakePipeline:
@@ -1040,7 +1059,7 @@ def test_run_full_analysis_handles_feishu_and_pipeline_exceptions(monkeypatch):
     config = SimpleNamespace(market_review_enabled=False)
     args = SimpleNamespace(workers=1, dry_run=False, no_notify=False, no_market_review=False)
 
-    main_module.run_full_analysis(config, args, stock_codes=["000001"])
+    main_module.run_watchlist_analysis(config, args, stock_codes=["000001"])
     assert calls and calls[0][0] == "feishu-error"
 
     monkeypatch.setattr(
@@ -1049,4 +1068,4 @@ def test_run_full_analysis_handles_feishu_and_pipeline_exceptions(monkeypatch):
         lambda config, max_workers=None: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
     )
 
-    main_module.run_full_analysis(config, args, stock_codes=["000001"])
+    main_module.run_watchlist_analysis(config, args, stock_codes=["000001"])

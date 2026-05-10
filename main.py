@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-A股自选股智能分析系统 - 主调度程序
+A股热点主题与自选股分析系统 - 主调度程序
 ===================================
 
 职责：
@@ -11,9 +11,10 @@ A股自选股智能分析系统 - 主调度程序
 4. 提供命令行入口
 
 使用方式：
-    python main.py              # 正常运行
+    python main.py              # 主链路：热点主题/板块/龙头/精细分析
+    python main.py --watchlist  # 自选股日报 + 大盘复盘
     python main.py --debug      # 调试模式
-    python main.py --dry-run    # 仅获取数据不分析
+    python main.py --dry-run    # 尽量跳过 Top 个股精细 LLM 分析
 
 交易理念（已融入分析）：
 - 严进策略：不追高，乖离率 > 5% 不买入
@@ -60,8 +61,10 @@ print(f"代理配置优化: 已设置 no_proxy={no_proxy}")
 pass
 
 
-# 忽略 pandas 的 SettingWithCopyWarning warnings
-warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+# 忽略 pandas 的 SettingWithCopyWarning warnings（pandas 3 已移除此 warning 类）
+_setting_with_copy_warning = getattr(pd.errors, "SettingWithCopyWarning", None)
+if _setting_with_copy_warning is not None:
+    warnings.filterwarnings('ignore', category=_setting_with_copy_warning)
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone, timedelta
@@ -301,7 +304,10 @@ class StockAnalysisPipeline:
             return self._benchmark_history
 
         try:
-            self._benchmark_history = self.akshare_fetcher.get_index_daily_data("000300", days=250)
+            provider = getattr(self, "fetcher_manager", None)
+            if provider is None or not hasattr(provider, "get_index_daily_data"):
+                provider = self.akshare_fetcher
+            self._benchmark_history = provider.get_index_daily_data("000300", days=250)
             logger.info("[RS] 已获取沪深300指数日线作为相对强弱基准")
         except Exception as e:
             logger.warning(f"[RS] 获取沪深300基准日线失败，跳过相对大盘强弱计算: {e}")
@@ -972,14 +978,15 @@ class StockAnalysisPipeline:
 def parse_arguments() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description='A股自选股智能分析系统',
+        description='A股热点主题与自选股智能分析系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例:
-  python main.py                    # 正常运行
+  python main.py                    # 主链路：热点主题/板块/龙头/精细分析
+  python main.py --watchlist        # 自选股日报 + 大盘复盘
   python main.py --debug            # 调试模式
-  python main.py --dry-run          # 仅获取数据，不进行 AI 分析
-  python main.py --stocks 600519,000001  # 指定分析特定股票
+  python main.py --dry-run          # 主链路跳过 Top 个股精细 LLM 分析
+  python main.py --stocks 600519,000001  # 指定股票做自选股日报
   python main.py --no-notify        # 不发送推送通知
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
@@ -998,13 +1005,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--dry-run',
         action='store_true',
-        help='仅获取数据，不进行 AI 分析'
+        help='主链路跳过 Top 个股精细 LLM；自选股模式仅获取数据'
     )
     
     parser.add_argument(
         '--stocks',
         type=str,
-        help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
+        help='指定要分析的股票代码，逗号分隔；会进入自选股日报模式'
+    )
+
+    parser.add_argument(
+        '--watchlist',
+        action='store_true',
+        help='运行自选股日报 + 大盘复盘（原默认模式）'
     )
     
     parser.add_argument(
@@ -1179,15 +1192,15 @@ def run_market_review(
     return None
 
 
-def run_full_analysis(
+def run_watchlist_analysis(
     config: Config,
     args: argparse.Namespace,
     stock_codes: Optional[List[str]] = None
 ):
     """
-    执行完整的分析流程（个股 + 大盘复盘）
+    执行自选股日报流程（个股 + 大盘复盘）
     
-    这是定时任务调用的主函数
+    这是历史默认模式，适合持续跟踪已有股票池。
     """
     try:
         # 创建调度器
@@ -1265,7 +1278,56 @@ def run_full_analysis(
             logger.error(f"飞书文档生成失败: {e}")
         
     except Exception as e:
-        logger.exception(f"分析流程执行失败: {e}")
+        logger.exception(f"自选股日报流程执行失败: {e}")
+
+
+def run_main_pipeline(
+    config: Config,
+    args: argparse.Namespace,
+):
+    """执行主链路：热点主题/板块/龙头筛选 + Top 个股精细分析。"""
+    try:
+        pipeline = StockAnalysisPipeline(
+            config=config,
+            max_workers=getattr(args, "workers", None)
+        )
+
+        result = pipeline.run_theme_radar(
+            theme_count=getattr(args, "theme_count", 5),
+            leader_top_n=getattr(args, "theme_top_n", 3),
+            lookback_days=getattr(args, "theme_lookback_days", 7),
+            include_detail_analysis=(
+                not getattr(args, "theme_no_llm_detail", False)
+                and not getattr(args, "dry_run", False)
+            ),
+            include_concepts=not getattr(args, "theme_no_concepts", False),
+            send_notification=not getattr(args, "no_notify", False),
+        )
+        logger.info("主链路执行完成")
+        return result
+    except Exception as e:
+        logger.exception(f"主链路执行失败: {e}")
+        return None
+
+
+def run_full_analysis(
+    config: Config,
+    args: argparse.Namespace,
+    stock_codes: Optional[List[str]] = None,
+):
+    """
+    兼容旧调用的入口。
+
+    新代码应使用 run_main_pipeline() 或 run_watchlist_analysis()，避免
+    “full” 一词在自选股日报和主动发现链路之间造成歧义。
+    """
+    logger.warning(
+        "run_full_analysis 已废弃：默认完整链路请使用 run_main_pipeline；"
+        "自选股日报请使用 run_watchlist_analysis"
+    )
+    if stock_codes or getattr(args, "watchlist", False) or getattr(args, "stocks", None):
+        return run_watchlist_analysis(config, args, stock_codes)
+    return run_main_pipeline(config, args)
 
 
 def main() -> int:
@@ -1285,37 +1347,30 @@ def main() -> int:
     setup_logging(debug=args.debug, log_dir=config.log_dir)
     
     logger.info("=" * 60)
-    logger.info("A股自选股智能分析系统 启动")
+    logger.info("A股热点主题与自选股分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
-    # 验证配置
-    warnings = config.validate()
-    for warning in warnings:
-        logger.warning(warning)
     
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
+
+    watchlist_mode_requested = bool(getattr(args, "watchlist", False) or stock_codes)
+
+    # 验证配置；主链路不依赖自选股列表，避免默认模式输出误导性警告。
+    warnings = config.validate()
+    if not watchlist_mode_requested:
+        warnings = [w for w in warnings if "自选股列表" not in w]
+    for warning in warnings:
+        logger.warning(warning)
     
     try:
-        # 模式0: 热点主题 LLM 雷达
+        # 模式0: 主链路（热点主题 LLM 雷达）
         if getattr(args, "theme_radar", False):
-            logger.info("模式: 热点主题 LLM 雷达")
-            pipeline = StockAnalysisPipeline(
-                config=config,
-                max_workers=args.workers
-            )
-            pipeline.run_theme_radar(
-                theme_count=args.theme_count,
-                leader_top_n=args.theme_top_n,
-                lookback_days=args.theme_lookback_days,
-                include_detail_analysis=not args.theme_no_llm_detail and not args.dry_run,
-                include_concepts=not getattr(args, "theme_no_concepts", False),
-                send_notification=not args.no_notify,
-            )
+            logger.info("模式: 主链路（热点主题/板块/龙头/精细分析）")
+            run_main_pipeline(config, args)
             return 0
 
         # 模式0.5: 热点主题历史回测
@@ -1377,7 +1432,10 @@ def main() -> int:
             from scheduler import run_with_schedule
             
             def scheduled_task():
-                run_full_analysis(config, args, stock_codes)
+                if watchlist_mode_requested:
+                    run_watchlist_analysis(config, args, stock_codes)
+                else:
+                    run_main_pipeline(config, args)
             
             run_with_schedule(
                 task=scheduled_task,
@@ -1387,7 +1445,12 @@ def main() -> int:
             return 0
         
         # 模式3: 正常单次运行
-        run_full_analysis(config, args, stock_codes)
+        if watchlist_mode_requested:
+            logger.info("模式: 自选股日报")
+            run_watchlist_analysis(config, args, stock_codes)
+        else:
+            logger.info("模式: 主链路（热点主题/板块/龙头/精细分析）")
+            run_main_pipeline(config, args)
         
         logger.info("\n程序执行完成")
         return 0

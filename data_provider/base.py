@@ -261,8 +261,8 @@ class DataFetcherManager:
         初始化默认数据源列表
         
         按优先级排序：
-        1. AkshareFetcher (Priority 1)
-        2. TushareFetcher (Priority 2)
+        1. TushareFetcher (Priority 0, token configured)
+        2. AkshareFetcher (Priority 1)
         3. BaostockFetcher (Priority 3)
         4. YfinanceFetcher (Priority 4)
         """
@@ -347,6 +347,43 @@ class DataFetcherManager:
         
         # 所有数据源都失败
         error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
+        logger.error(error_summary)
+        raise DataFetchError(error_summary)
+
+    def get_index_daily_data(
+        self,
+        index_code: str = "000300",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 250,
+    ) -> pd.DataFrame:
+        """获取指数日线数据（自动切换支持该接口的数据源）。"""
+        errors = []
+
+        for fetcher in self._fetchers:
+            if not hasattr(fetcher, "get_index_daily_data"):
+                continue
+            try:
+                logger.info(f"尝试使用 [{fetcher.name}] 获取指数 {index_code}...")
+                df = fetcher.get_index_daily_data(
+                    index_code=index_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    logger.info(f"[{fetcher.name}] 成功获取指数 {index_code}")
+                    return df
+
+                error_msg = f"[{fetcher.name}] 指数失败: 返回空数据"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+            except Exception as e:
+                error_msg = f"[{fetcher.name}] 指数失败: {str(e)}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+
+        error_summary = f"所有数据源获取指数 {index_code} 失败:\n" + "\n".join(errors)
         logger.error(error_summary)
         raise DataFetchError(error_summary)
     

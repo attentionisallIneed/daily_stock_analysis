@@ -139,6 +139,19 @@ class BaostockFetcher(BaseFetcher):
         else:
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"sz.{code}"
+
+    def _convert_index_code(self, index_code: str) -> str:
+        """转换指数代码为 Baostock 格式。"""
+        code = str(index_code or "").strip()
+        if code.startswith(("sh.", "sz.")):
+            return code.lower()
+        code = code.replace(".SH", "").replace(".SZ", "").replace(".sh", "").replace(".sz", "")
+        if code.startswith(("000", "880", "881")):
+            return f"sh.{code}"
+        if code.startswith("399"):
+            return f"sz.{code}"
+        logger.warning(f"无法确定指数 {code} 的市场，默认使用沪市")
+        return f"sh.{code}"
     
     @retry(
         stop=stop_after_attempt(3),
@@ -229,6 +242,51 @@ class BaostockFetcher(BaseFetcher):
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         
+        return df
+
+    def get_index_daily_data(
+        self,
+        index_code: str = "000300",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 250,
+    ) -> pd.DataFrame:
+        """获取指数日线数据，用作相对强弱基准。"""
+        from datetime import timedelta
+
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
+            start_date = start_dt.strftime("%Y-%m-%d")
+
+        bs_code = self._convert_index_code(index_code)
+        logger.info(f"[BaostockFetcher] 获取指数 {index_code} 数据: {start_date} ~ {end_date}")
+
+        with self._baostock_session() as bs:
+            rs = bs.query_history_k_data_plus(
+                code=bs_code,
+                fields="date,open,high,low,close,volume,amount,pctChg",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3",
+            )
+            if rs.error_code != "0":
+                raise DataFetchError(f"Baostock 指数查询失败: {rs.error_msg}")
+
+            data_list = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+
+        if not data_list:
+            raise DataFetchError(f"Baostock 未查询到指数 {index_code} 的数据")
+
+        raw_df = pd.DataFrame(data_list, columns=rs.fields)
+        df = self._normalize_data(raw_df, index_code)
+        df = self._clean_data(df)
+        df = self._calculate_indicators(df)
+        logger.info(f"[BaostockFetcher] 指数 {index_code} 获取成功，共 {len(df)} 条数据")
         return df
 
 

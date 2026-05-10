@@ -289,7 +289,10 @@ class MarketAnalyzer:
         overview.indices = self._get_main_indices()
         
         # 2. 获取涨跌统计
-        self._get_market_statistics(overview)
+        if getattr(self.config, "market_breadth_enabled", False):
+            self._get_market_statistics(overview)
+        else:
+            logger.info("[大盘] 跳过全市场涨跌统计（MARKET_BREADTH_ENABLED=false）")
         
         # 3. 获取板块涨跌榜
         self._get_sector_rankings(overview)

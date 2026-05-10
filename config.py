@@ -101,6 +101,7 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
+    market_breadth_enabled: bool = False      # 是否拉取全市场涨跌家数（接口不稳定，默认关闭）
     
     # === 流控配置（防封禁关键参数）===
     # Akshare 请求间隔范围（秒）
@@ -158,21 +159,31 @@ class Config:
         if not stock_list:
             stock_list = []
         
-        # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
-        tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
-        tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
-        
-        serpapi_keys_str = os.getenv('SERPAPI_API_KEYS', '')
-        serpapi_keys = [k.strip() for k in serpapi_keys_str.split(',') if k.strip()]
+        # 解析搜索引擎 API Keys（支持多个 key，逗号分隔；兼容单数和大小写历史写法）
+        tavily_api_keys = cls._parse_key_list(
+            cls._get_env_any('TAVILY_API_KEYS', 'TAVILY_API_KEY', 'tavily_api_keys', 'tavily_api_key')
+        )
+        serpapi_keys = cls._parse_key_list(
+            cls._get_env_any('SERPAPI_API_KEYS', 'SERPAPI_API_KEY', 'serpapi_api_keys', 'serpapi_api_key')
+        )
         
         return cls(
             stock_list=stock_list,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
-            tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_token=cls._get_env_any(
+                'TUSHARE_TOKEN',
+                'TUSHARE_API_KEY',
+                'TUSHARE_API_TOKEN',
+                'TUSHARE_KEY',
+                'tushare_token',
+                'tushare_api_key',
+                'tushare_api_token',
+                'tushare_key',
+            ),
             openai_api_key=os.getenv('OPENAI_API_KEY'),
-            openai_base_url=os.getenv('OPENAI_BASE_URL'),
+            openai_base_url=cls._normalize_openai_base_url(os.getenv('OPENAI_BASE_URL')),
             openai_model=os.getenv('OPENAI_MODEL'),
             llm_request_delay=float(os.getenv('LLM_REQUEST_DELAY', os.getenv('GEMINI_REQUEST_DELAY', '2.0'))),
             llm_max_retries=int(os.getenv('LLM_MAX_RETRIES', os.getenv('GEMINI_MAX_RETRIES', '5'))),
@@ -203,7 +214,34 @@ class Config:
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            market_breadth_enabled=os.getenv('MARKET_BREADTH_ENABLED', 'false').lower() == 'true',
         )
+
+    @staticmethod
+    def _normalize_openai_base_url(base_url: Optional[str]) -> Optional[str]:
+        """Normalize OpenAI-compatible base URLs to the standard /v1 endpoint."""
+        if not base_url:
+            return base_url
+        normalized = base_url.strip().rstrip('/')
+        if not normalized:
+            return None
+        if normalized.endswith('/v1'):
+            return normalized
+        return f"{normalized}/v1"
+
+    @staticmethod
+    def _get_env_any(*names: str) -> Optional[str]:
+        for name in names:
+            value = os.getenv(name)
+            if value and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _parse_key_list(value: Optional[str]) -> List[str]:
+        if not value:
+            return []
+        return [item.strip() for item in value.split(',') if item.strip()]
     
     @classmethod
     def reset_instance(cls) -> None:

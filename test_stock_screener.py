@@ -53,6 +53,19 @@ class FakeSectorFetcher:
         return _make_df([10.0] * 80)
 
 
+class FailingConstituentFetcher(FakeSectorFetcher):
+    def __init__(self):
+        super().__init__([])
+        self.constituent_calls = 0
+
+    def get_sector_constituents(self, sector_name, sector_type="industry"):
+        self.constituent_calls += 1
+        raise RuntimeError("constituents failed")
+
+    def resolve_stock_code_by_name(self, stock_name):
+        return {"强势股": "000001"}.get(stock_name, "")
+
+
 def test_hot_sector_screener_filters_and_ranks_candidates():
     valid_closes = [10 + i * 0.05 for i in range(80)]
     weak_closes = [10.0] * 80
@@ -121,3 +134,29 @@ def test_screening_report_contains_ranking_table():
 
     assert "热门板块规则选股报告" in report
     assert "| 1 | 000001 | 强势股 | 测试行业 |" in report
+
+
+def test_leading_stock_fallback_when_constituents_fail_or_are_skipped():
+    closes = [10 + i * 0.05 for i in range(80)]
+    daily_fetcher = FakeDailyFetcher({"000001": _make_df(closes)})
+
+    failing_fetcher = FailingConstituentFetcher()
+    fallback_result = StockScreener(
+        daily_fetcher=daily_fetcher,
+        sector_fetcher=failing_fetcher,
+        min_avg_amount=100_000_000,
+    ).screen_hot_sectors(sector_count=1, top_n=1)
+
+    assert fallback_result.selected[0].code == "000001"
+    assert fallback_result.selected[0].is_sector_leader is True
+    assert failing_fetcher.constituent_calls == 1
+
+    skipped_fetcher = FailingConstituentFetcher()
+    skipped_result = StockScreener(
+        daily_fetcher=daily_fetcher,
+        sector_fetcher=skipped_fetcher,
+        min_avg_amount=100_000_000,
+    ).screen_hot_sectors(sector_count=1, top_n=1, prefer_leading_stocks=True)
+
+    assert skipped_result.selected[0].code == "000001"
+    assert skipped_fetcher.constituent_calls == 0

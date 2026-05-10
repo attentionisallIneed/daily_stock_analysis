@@ -1,8 +1,18 @@
-# A股自选股智能分析系统
+# A股热点主题与自选股智能分析系统
 
-本项目用于对 A 股自选股做每日自动分析：抓取行情数据、计算技术指标、搜索新闻情报、调用 OpenAI 标准/兼容 LLM 生成分析报告，并通过企业微信、飞书、Telegram、邮件或自定义 Webhook 推送。
+本项目默认运行“热点主题/板块/龙头/精细分析”主链路，也保留自选股日报模式：抓取行情数据、计算技术指标、搜索新闻情报、调用 OpenAI 标准/兼容 LLM 生成分析报告，并通过企业微信、飞书、Telegram、邮件或自定义 Webhook 推送。
 
 ## 核心流程
+
+默认主链路：
+
+1. 获取大盘环境和热门行业/概念板块。
+2. 汇总板块、新闻和资金证据，调用 LLM 做热点主题发现。
+3. 对热门板块成分股做规则层筛选和候选龙头排序。
+4. 对 Top N 候选龙头复用个股精细分析链路。
+5. 保存主题雷达报告、主题历史，并按配置推送。
+
+自选股日报模式：
 
 1. 从 `.env` 读取股票列表、LLM、搜索、通知和数据源配置。
 2. 按优先级抓取日线行情并写入 SQLite。
@@ -32,13 +42,13 @@ OPENAI_MODEL=gpt-4o-mini
 
 ### 必需
 
-- `STOCK_LIST`：要分析的股票代码，逗号分隔。
 - `OPENAI_API_KEY`：OpenAI 或兼容服务 API Key。
 - `OPENAI_BASE_URL`：OpenAI 标准 `/v1` 接口地址。
 - `OPENAI_MODEL`：要调用的模型名。
 
 ### 推荐
 
+- `STOCK_LIST`：自选股日报模式要分析的股票代码，逗号分隔。
 - `TAVILY_API_KEYS`：新闻搜索主源，推荐配置。
 - `TUSHARE_TOKEN`：A 股行情备用数据源，推荐配置。
 
@@ -72,6 +82,12 @@ python test_env.py --fetch
 
 # 测试 OpenAI 兼容 LLM 调用
 python test_env.py --llm
+
+# 运行默认主链路：热点主题/板块/龙头/精细分析
+python main.py
+
+# 自选股日报，不发送通知
+python main.py --watchlist --no-notify
 
 # 仅分析指定股票，不发送通知
 python main.py --stocks 600519 --no-notify --no-market-review

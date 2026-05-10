@@ -165,12 +165,16 @@ def test_format_converters_and_custom_payloads():
 
     html = service._markdown_to_html("# Title\n\n**bold**\n- item\n> quote\n---")
     telegram = service._convert_to_telegram_markdown("# Title\n**bold** [link](url)")
+    telegram_html = service._convert_to_telegram_html("# Title\n\n| A | B |\n| - | - |\n| 1 | 2 |")
 
     assert "<h1>Title</h1>" in html
     assert "<strong>bold</strong>" in html
     assert "Title" in telegram
     assert "*bold*" in telegram
     assert "\\[link\\]" in telegram
+    assert "<b>Title</b>" in telegram_html
+    assert "<pre>A    B" in telegram_html
+    assert "| A | B |" not in telegram_html
     assert service._build_custom_webhook_payload("https://oapi.dingtalk.com/robot/send", "content")["msgtype"] == "markdown"
     assert service._build_custom_webhook_payload("https://discord.com/api/webhooks/1", "x" * 2001)["content"].endswith("...")
     assert service._build_custom_webhook_payload("https://hooks.slack.com/services/T", "content")["mrkdwn"] is True
@@ -342,7 +346,17 @@ def test_telegram_sender_handles_short_long_and_parse_fallback(monkeypatch):
     monkeypatch.setattr(notification.requests, "post", fake_post)
 
     assert real_sender._send_telegram_message("api", "chat", "**bad**") is True
-    assert posts[0]["parse_mode"] == "Markdown"
+    assert posts[0]["parse_mode"] == "HTML"
+    assert "<b>bad</b>" in posts[0]["text"]
+    assert "parse_mode" not in posts[1]
+
+    responses = [
+        FakeResponse(status_code=400, text="Bad Request: can't parse entities"),
+        FakeResponse(payload={"ok": True}),
+    ]
+    posts.clear()
+    assert real_sender._send_telegram_message("api", "chat", "sector_001") is True
+    assert posts[0]["parse_mode"] == "HTML"
     assert "parse_mode" not in posts[1]
 
     monkeypatch.setattr(notification.requests, "post", lambda *args, **kwargs: FakeResponse(status_code=500, text="bad"))

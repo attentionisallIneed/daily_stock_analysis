@@ -7,6 +7,7 @@ Top N 候选股可由主流程复用现有 analyze_stock() 做精细报告。
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -214,6 +215,7 @@ class StockScreener:
         top_n: int = 3,
         include_concepts: bool = True,
         benchmark_df: Optional[pd.DataFrame] = None,
+        prefer_leading_stocks: bool = False,
     ) -> ScreeningResult:
         """按热门板块生成候选池并排序。"""
         result = ScreeningResult()
@@ -226,6 +228,12 @@ class StockScreener:
 
         seen_codes = set()
         for sector in result.sectors:
+            leading_rows = self._leading_stock_rows(sector)
+            if prefer_leading_stocks and leading_rows:
+                for row in leading_rows:
+                    self._screen_constituent_row(row, sector, benchmark_df, None, seen_codes, result)
+                continue
+
             try:
                 constituents = self.sector_fetcher.get_sector_constituents(
                     sector.name,
@@ -233,32 +241,80 @@ class StockScreener:
                 )
             except Exception as e:
                 logger.warning(f"[选股] 获取板块 {sector.name} 成分股失败: {e}")
-                continue
+                constituents = leading_rows
+                if not constituents:
+                    continue
 
             sector_df = self._get_sector_history(sector)
             for row in constituents:
-                code = str(row.get("code") or "").strip()
-                name = str(row.get("name") or "").strip()
-                if not code or not name or code in seen_codes:
-                    continue
-                seen_codes.add(code)
-
-                prefilter_reasons = self._prefilter_quote(row)
-                if prefilter_reasons:
-                    result.filtered.append(
-                        {"code": code, "name": name, "sector_name": sector.name, "reasons": prefilter_reasons}
-                    )
-                    continue
-
-                candidate = self._screen_one_stock(row, sector, benchmark_df, sector_df)
-                if isinstance(candidate, ScreenedStock):
-                    result.candidates.append(candidate)
-                else:
-                    result.filtered.append(candidate)
+                self._screen_constituent_row(row, sector, benchmark_df, sector_df, seen_codes, result)
 
         result.candidates.sort(key=lambda item: item.composite_score, reverse=True)
         result.selected = result.candidates[: max(1, top_n)]
         return result
+
+    def _screen_constituent_row(
+        self,
+        row: Dict[str, Any],
+        sector: SectorCandidate,
+        benchmark_df: Optional[pd.DataFrame],
+        sector_df: Optional[pd.DataFrame],
+        seen_codes: set,
+        result: ScreeningResult,
+    ) -> None:
+        code = str(row.get("code") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not code or not name or code in seen_codes:
+            return
+        seen_codes.add(code)
+
+        prefilter_reasons = self._prefilter_quote(row)
+        if prefilter_reasons:
+            result.filtered.append(
+                {"code": code, "name": name, "sector_name": sector.name, "reasons": prefilter_reasons}
+            )
+            return
+
+        candidate = self._screen_one_stock(row, sector, benchmark_df, sector_df)
+        if isinstance(candidate, ScreenedStock):
+            result.candidates.append(candidate)
+        else:
+            result.filtered.append(candidate)
+
+    def _leading_stock_rows(self, sector: SectorCandidate) -> List[Dict[str, Any]]:
+        """Build a minimal candidate row from the sector API's leading-stock field."""
+        name, code = self._parse_leading_stock(sector.leading_stock)
+        if name and not code and hasattr(self.sector_fetcher, "resolve_stock_code_by_name"):
+            try:
+                code = str(self.sector_fetcher.resolve_stock_code_by_name(name) or "")
+            except Exception as exc:
+                logger.warning(f"[选股] 解析领涨股 {name} 代码失败: {exc}")
+        if not name or not code:
+            return []
+        return [
+            {
+                "code": code,
+                "name": name,
+                "price": 0.0,
+                "change_pct": sector.change_pct,
+                "amount": 0.0,
+                "turnover_rate": 0.0,
+                "from_leading_stock": True,
+            }
+        ]
+
+    @staticmethod
+    def _parse_leading_stock(value: str) -> Tuple[str, str]:
+        text = str(value or "").strip()
+        if not text:
+            return "", ""
+        text = re.split(r"[、,/，\s]+", text)[0].strip()
+        code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+        code = code_match.group(1) if code_match else ""
+        name = re.sub(r"(?<!\d)\d{6}(?!\d)", "", text)
+        name = re.sub(r"(涨跌幅|涨幅|涨停|[\(\)（）:：])", "", name)
+        name = re.sub(r"[0-9.+%\\-]+$", "", name).strip()
+        return name or text, code
 
     def _build_sector_candidates(self, raw_sectors: List[Dict[str, Any]], sector_count: int) -> List[SectorCandidate]:
         sectors = []
@@ -341,12 +397,12 @@ class StockScreener:
         reasons = []
         if "ST" in name.upper() or "退" in name:
             reasons.append("ST或退市风险标的")
-        if not code.startswith(("0", "3", "6", "8", "4")):
+        if not code.startswith(("0", "3", "4", "6", "8")):
             reasons.append("非A股常见代码段")
 
         price = self._safe_float(row.get("price"))
         amount = self._safe_float(row.get("amount"))
-        if price <= 0 and amount <= 0:
+        if not row.get("from_leading_stock") and price <= 0 and amount <= 0:
             reasons.append("停牌或实时行情无有效成交")
         return reasons
 
@@ -462,13 +518,23 @@ class StockScreener:
         if self._benchmark_loaded:
             return self._benchmark_df
         self._benchmark_loaded = True
-        if not hasattr(self.sector_fetcher, "get_index_daily_data"):
-            return None
-        try:
-            self._benchmark_df = self.sector_fetcher.get_index_daily_data("000300", days=250)
-        except Exception as e:
-            logger.warning(f"[选股] 获取沪深300基准失败，跳过RS大盘基准: {e}")
-            self._benchmark_df = None
+        providers = [self.daily_fetcher, self.sector_fetcher]
+        seen = set()
+        errors = []
+        for provider in providers:
+            if provider is None or id(provider) in seen or not hasattr(provider, "get_index_daily_data"):
+                continue
+            seen.add(id(provider))
+            provider_name = getattr(provider, "name", provider.__class__.__name__)
+            try:
+                self._benchmark_df = provider.get_index_daily_data("000300", days=250)
+                logger.info(f"[选股] 已获取沪深300基准，来源: {provider_name}")
+                return self._benchmark_df
+            except Exception as e:
+                errors.append(f"{provider_name}: {e}")
+        if errors:
+            logger.warning(f"[选股] 获取沪深300基准失败，跳过RS大盘基准: {'；'.join(errors)}")
+        self._benchmark_df = None
         return self._benchmark_df
 
     def _get_sector_history(self, sector: SectorCandidate) -> Optional[pd.DataFrame]:

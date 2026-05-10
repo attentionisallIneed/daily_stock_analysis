@@ -432,6 +432,44 @@ class OpenAIAnalyzer:
     def is_available(self) -> bool:
         """检查分析器是否可用"""
         return self._is_available
+
+    @staticmethod
+    def _extract_response_text(response: Any) -> str:
+        """从 OpenAI SDK 对象、兼容接口字典或纯文本响应中提取正文。"""
+        def normalize_text(text: Any) -> str:
+            value = str(text)
+            lowered = value.lstrip().lower()
+            if lowered.startswith("<!doctype") or lowered.startswith("<html"):
+                raise ValueError("API 返回 HTML 页面，请检查 OPENAI_BASE_URL 是否为标准 /v1 接口地址")
+            return value
+
+        if isinstance(response, str):
+            return normalize_text(response)
+
+        if isinstance(response, dict):
+            choices = response.get("choices") or []
+            if choices:
+                first = choices[0]
+                message = first.get("message") if isinstance(first, dict) else None
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if content:
+                        return normalize_text(content)
+                content = first.get("content") if isinstance(first, dict) else None
+                if content:
+                    return normalize_text(content)
+
+        choices = getattr(response, "choices", None)
+        if choices:
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None) if message is not None else None
+            if content:
+                return normalize_text(content)
+
+        if hasattr(response, "model_dump"):
+            return OpenAIAnalyzer._extract_response_text(response.model_dump())
+
+        raise ValueError("API 返回空响应或无法识别的响应格式")
     
     def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
         """
@@ -463,10 +501,7 @@ class OpenAIAnalyzer:
                     stream=False
                 )
                 
-                if response and response.choices and response.choices[0].message.content:
-                    return response.choices[0].message.content
-                else:
-                    raise ValueError("API 返回空响应")
+                return self._extract_response_text(response)
                     
             except Exception as e:
                 error_str = str(e)

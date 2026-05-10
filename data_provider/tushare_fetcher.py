@@ -16,7 +16,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -52,7 +52,7 @@ class TushareFetcher(BaseFetcher):
     """
     
     name = "TushareFetcher"
-    priority = 2
+    priority = 0
     
     def __init__(self, rate_limit_per_minute: int = 80):
         """
@@ -174,6 +174,18 @@ class TushareFetcher(BaseFetcher):
             # 默认尝试深市
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
+
+    def _convert_index_code(self, index_code: str) -> str:
+        """转换指数代码为 Tushare 格式。"""
+        code = str(index_code or "").strip()
+        if "." in code:
+            return code.upper()
+        if code.startswith(("000", "880", "881")):
+            return f"{code}.SH"
+        if code.startswith(("399", "159")):
+            return f"{code}.SZ"
+        logger.warning(f"无法确定指数 {code} 的市场，默认使用沪市")
+        return f"{code}.SH"
     
     @retry(
         stop=stop_after_attempt(3),
@@ -269,6 +281,47 @@ class TushareFetcher(BaseFetcher):
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         
+        return df
+
+    def get_index_daily_data(
+        self,
+        index_code: str = "000300",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 250,
+    ) -> pd.DataFrame:
+        """获取指数日线数据，用作相对强弱基准。"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
+            start_date = start_dt.strftime("%Y-%m-%d")
+
+        self._check_rate_limit()
+        ts_code = self._convert_index_code(index_code)
+        ts_start = start_date.replace("-", "")
+        ts_end = end_date.replace("-", "")
+
+        logger.info(f"[TushareFetcher] 获取指数 {index_code} 数据: {start_date} ~ {end_date}")
+        try:
+            raw_df = self._api.index_daily(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+        except Exception as e:
+            raise DataFetchError(f"Tushare 获取指数 {index_code} 失败: {e}") from e
+
+        if raw_df is None or raw_df.empty:
+            raise DataFetchError(f"Tushare 未获取到指数 {index_code} 的数据")
+
+        df = self._normalize_data(raw_df, index_code)
+        df = self._clean_data(df)
+        df = self._calculate_indicators(df)
+        logger.info(f"[TushareFetcher] 指数 {index_code} 获取成功，共 {len(df)} 条数据")
         return df
 
 
