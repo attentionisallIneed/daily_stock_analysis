@@ -82,6 +82,23 @@ def test_yfinance_converts_codes_and_normalizes_downloaded_data():
     assert normalized["pct_chg"].tolist() == [0.0, 10.0]
     assert normalized["amount"].tolist() == [1000.0, 2200.0]
 
+    multi_index_raw = pd.DataFrame(
+        {
+            ("Close", "600519.SS"): [10.0, 11.0],
+            ("High", "600519.SS"): [11.0, 12.0],
+            ("Low", "600519.SS"): [9.5, 10.5],
+            ("Open", "600519.SS"): [10.0, 11.0],
+            ("Volume", "600519.SS"): [100, 200],
+        },
+        index=pd.Index(pd.to_datetime(["2026-01-01", "2026-01-02"]), name="Date"),
+    )
+
+    multi_index_normalized = fetcher._normalize_data(multi_index_raw, "600519")
+
+    assert multi_index_normalized["close"].tolist() == [10.0, 11.0]
+    assert multi_index_normalized["volume"].tolist() == [100, 200]
+    assert multi_index_normalized["amount"].tolist() == [1000.0, 2200.0]
+
 
 def test_tushare_converts_codes_normalizes_data_and_rate_limits(monkeypatch):
     fetcher = object.__new__(TushareFetcher)
