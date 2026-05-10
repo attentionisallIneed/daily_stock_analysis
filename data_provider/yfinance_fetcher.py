@@ -144,9 +144,6 @@ class YfinanceFetcher(BaseFetcher):
         date, open, high, low, close, volume, amount, pct_chg
         """
         df = df.copy()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [self._flatten_column_name(column) for column in df.columns]
         
         # 重置索引，将日期从索引变为列
         df = df.reset_index()
@@ -184,19 +181,6 @@ class YfinanceFetcher(BaseFetcher):
         df = df[existing_cols]
         
         return df
-
-    @staticmethod
-    def _flatten_column_name(column) -> str:
-        expected = {"Date", "Open", "High", "Low", "Close", "Volume"}
-        if isinstance(column, tuple):
-            for part in column:
-                if part in expected:
-                    return part
-            for part in column:
-                if part not in (None, ""):
-                    return str(part)
-            return ""
-        return str(column)
 
 
 if __name__ == "__main__":
