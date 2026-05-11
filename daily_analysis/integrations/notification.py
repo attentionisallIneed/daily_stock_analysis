@@ -2010,7 +2010,12 @@ class NotificationService:
             filename = f"report_{date_str}.md"
 
         # 确保 reports 目录存在
-        reports_dir = Path(__file__).parent / 'reports'
+        module_path = Path(__file__).resolve()
+        if module_path.parent.name == "integrations" and module_path.parent.parent.name == "daily_analysis":
+            project_root = module_path.parent.parent.parent
+        else:
+            project_root = module_path.parent
+        reports_dir = project_root / 'reports'
         reports_dir.mkdir(parents=True, exist_ok=True)
 
         filepath = reports_dir / filename

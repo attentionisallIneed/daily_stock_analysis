@@ -144,7 +144,7 @@ class Config:
         3. 代码中的默认值
         """
         # 加载项目根目录下的 .env 文件
-        env_path = Path(__file__).parent / '.env'
+        env_path = Path(__file__).resolve().parent.parent / '.env'
         load_dotenv(dotenv_path=env_path)
 
         # 解析自选股列表（逗号分隔）

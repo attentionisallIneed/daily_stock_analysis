@@ -8,7 +8,46 @@ from types import SimpleNamespace
 
 import akshare as ak
 import config as config_module
+import daily_analysis.config as package_config
+import daily_analysis.integrations.notification as package_notification
 import pandas as pd
+
+
+def test_package_config_loads_env_from_project_root(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    package_dir = project_root / "daily_analysis"
+    package_dir.mkdir(parents=True)
+    (project_root / ".env").write_text(
+        "STOCK_LIST=600519,000001\nOPENAI_BASE_URL=https://example.com\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(package_config, "__file__", str(package_dir / "config.py"))
+    monkeypatch.delenv("STOCK_LIST", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    package_config.Config.reset_instance()
+
+    try:
+        config = package_config.Config.get_instance()
+    finally:
+        package_config.Config.reset_instance()
+
+    assert config.stock_list == ["600519", "000001"]
+    assert config.openai_base_url == "https://example.com/v1"
+
+
+def test_package_notification_saves_reports_to_project_root(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    package_dir = project_root / "daily_analysis" / "integrations"
+    package_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(package_notification, "__file__", str(package_dir / "notification.py"))
+    service = object.__new__(package_notification.NotificationService)
+
+    path = service.save_report_to_file("content", filename="custom.md")
+
+    assert path == str(project_root / "reports" / "custom.md")
+    assert (project_root / "reports" / "custom.md").read_text(encoding="utf-8") == "content"
 
 
 def test_local_demo_entrypoints_run_without_external_services(monkeypatch, capsys, tmp_path):
